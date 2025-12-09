@@ -1,0 +1,14 @@
+prefix=/data/Edge-SDK/third_party/ffmpeg/
+exec_prefix=${prefix}
+libdir=/data/Edge-SDK/third_party/ffmpeg//lib
+includedir=/data/Edge-SDK/third_party/ffmpeg//include
+
+Name: libswscale
+Description: FFmpeg image rescaling library
+Version: 5.3.100
+Requires: 
+Requires.private: libavutil >= 56.22.100
+Conflicts:
+Libs: -L${libdir}  -lswscale 
+Libs.private: -lm
+Cflags: -I${includedir}

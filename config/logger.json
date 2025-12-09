@@ -1,0 +1,14 @@
+{
+  "logger": {
+    "level": "INFO",
+    "console_output": true,
+    "log_directory": "logs",
+    "file_name_pattern": "esdk_sophon_{date}.log",
+    "rotation": {
+      "enable": true,
+      "max_days": 15,
+      "max_file_size_mb": 100,
+      "compress_old_logs": false
+    }
+  }
+}

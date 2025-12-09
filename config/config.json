@@ -1,0 +1,230 @@
+{
+  "_comment": "ESDK_Sophon 完整配置文件",
+  "_version": "1.0.0",
+  "_last_updated": "2025-10-25",
+
+  "logger": {
+    "_comment": "日志系统配置",
+    "level": "INFO",
+    "console_output": true,
+    "log_directory": "logs",
+    "rotation": {
+      "enabled": true,
+      "max_days": 15,
+      "max_file_size_mb": 100
+    }
+  },
+
+  "mqtt": {
+    "_comment": "MQTT通信配置",
+    "broker": "tcp://jiaoyujidi.work:1883",
+    "client_id": "analysis_device_WRSE7002",
+    "username": "",
+    "password": "",
+    "keepalive": 60,
+    "qos": 1,
+    "topics": {
+      "_comment": "MQTT主题配置 - 使用device_sn替换占位符",
+      "event_push": "drone/{device_sn}/info/event",
+      "services_down": "thing/product/{device_sn}/services",
+      "services_reply": "thing/product/{device_sn}/services_reply",
+      "events_up": "thing/product/{device_sn}/events"
+    },
+    "reconnect": {
+      "enabled": true,
+      "max_retries": 5,
+      "retry_interval_ms": 3000
+    }
+  },
+
+  "detector": {
+    "_comment": "视觉检测器配置",
+    "ppyoloe": {
+      "_comment": "PP-YOLOE目标检测模型 (PaddleDetection)",
+      "model_path": "/data/Edge-SDK/models/PaddleDetection/ppyoloe_crn_m_300e_coco_289.bmodel",
+      "config_path": "/data/Edge-SDK/models/PaddleDetection/infer_cfg.yml",
+      "labels_path": "/data/Edge-SDK/models/coco.names",
+      "confidence_threshold": 0.25,
+      "nms_threshold": 0.45,
+      "input_size": [640, 640],
+      "device_id": 0
+    },
+    "yolov10": {
+      "_comment": "YOLOv10备用配置 (已弃用,保留以防万一)",
+      "enabled": false,
+      "model_path": "models/yolov10n.bmodel",
+      "config_path": "models/yolov10.yaml",
+      "labels_path": "models/coco.names"
+    }
+  },
+
+  "segmentation": {
+    "_comment": "语义分割配置",
+    "paddleseg": {
+      "_comment": "PaddleSeg语义分割模型",
+      "enabled": true,
+      "model_path": "/data/Edge-SDK/models/paddleSeg/pp_liteseg.bmodel",
+      "config_path": "/data/Edge-SDK/models/paddleSeg/deploy.yaml",
+      "num_classes": 21,
+      "input_size": [512, 512]
+    }
+  },
+
+  "geo_decode": {
+    "_comment": "GeoDecodeAPI 配置 - 用于计算检测框的 GPS 坐标",
+    "api_url": "http://127.0.0.1:8122/geoDecode/arithmetic/getLonLatByPoints",
+    "media_file_directory": "/data/Edge-SDK/build/bin",
+    "timeout_ms": 5000,
+    "_note": "media_file_directory 是媒体文件下载目录的绝对路径"
+  },
+
+  "device": {
+    "_comment": "无人机设备配置",
+    "analysis_sn": "analysis_device_WRSE7002",
+    "gateway_sn": "7CTDM3D00B9K63",
+    "_gateway_sn_comment": "机场网关序列号，用于 DJI Cloud API（如 flighttask_pause）",
+
+    "aircraft": {
+      "_comment": "飞行器配置 (M3TD)",
+      "type": "M3TD",
+      "sn": "1581F6Q8D243W00C3816",
+      "_sn_comment": "飞行器序列号，用于订阅 OSD 数据 (thing/product/{aircraft_sn}/osd)",
+      "payload_index": "0-91-1",
+      "_payload_index_comment": "飞行器枚举值: domain-type-sub_type"
+    },
+    "camera": {
+      "_comment": "相机配置 (M3TD 相机)",
+      "type": "M3TD_Camera",
+      "payload_index": "81-0-0",
+      "_payload_index_comment": "相机枚举值: domain-type-sub_type，用于相机控制命令",
+      "enable_h264": true,
+      "enable_rgb": true,
+      "resolution": {
+        "width": 1920,
+        "height": 1080
+      },
+      "fps": 30
+    },
+    "gimbal": {
+      "pitch_range": [-90, 30],
+      "yaw_range": [-180, 180],
+      "pitch_speed": 10.0,
+      "yaw_speed": 10.0
+    }
+  },
+
+  "video": {
+    "_comment": "视频处理和推流配置",
+    "decoder": {
+      "_comment": "H.264 解码器配置 (FFmpeg)",
+      "enabled": true,
+      "resolution": {
+        "width": 1920,
+        "height": 1080,
+        "_note": "解码器输出分辨率，应与相机分辨率一致"
+      },
+      "thread_count": 4,
+      "pixel_format": "YUV420P",
+      "_note": "使用 FFmpeg av_parser_parse2() 自动提取 SPS/PPS，无需手动配置"
+    },
+    "rtmp": {
+      "_comment": "RTMP推流配置 - 将检测结果实时推送到RTMP服务器",
+      "enabled": true,
+      "url": "rtmp://27.223.85.130:3519/live/u25IGQMHg?sign=9hcIMwaNR",
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "bitrate": 2000,
+      "_note": "bitrate单位为kbps, url需要根据实际服务器地址修改"
+    },
+    "recording": {
+      "_comment": "本地录制配置（可选）",
+      "enabled": false,
+      "output_directory": "recordings",
+      "format": "mp4",
+      "codec": "h264"
+    }
+  },
+
+  "waypoint": {
+    "_comment": "航点任务配置",
+    "kmz_directory": "waypoints",
+    "upload_chunk_size": 1024,
+    "execution": {
+      "auto_start": false,
+      "return_home_on_complete": true,
+      "pause_on_detection": false
+    }
+  },
+
+  "database": {
+    "_comment": "数据库配置（预留）",
+    "type": "sqlite",
+    "path": "data/esdk.db",
+    "connection_pool_size": 5
+  },
+
+  "performance": {
+    "_comment": "性能优化配置",
+    "thread_pool_size": 4,
+    "max_queue_size": 100,
+    "memory_limit_mb": 512,
+    "enable_profiling": false
+  },
+
+  "zoom_capture": {
+    "_comment": "智能变焦拍照功能配置",
+    "enabled": true,
+    "_enabled_comment": "是否启用检测到目标后自动变焦拍照",
+
+    "trigger": {
+      "min_target_count": 3,
+      "_min_target_count_comment": "触发拍照的最小目标数量",
+
+      "stable_frame_count": 5,
+      "_stable_frame_count_comment": "需要连续稳定检测到目标的帧数",
+
+      "min_confidence": 0.5,
+      "_min_confidence_comment": "目标最小置信度阈值"
+    },
+
+    "cooldown": {
+      "time_seconds": 30.0,
+      "_time_seconds_comment": "时间冷却（秒），避免重复拍照",
+
+      "distance_meters": 50.0,
+      "_distance_meters_comment": "距离冷却（米），同一区域不重复拍照"
+    }
+  },
+
+  "tracker": {
+    "_comment": "目标追踪配置",
+    "enabled": true,
+    "type": "bytetrack",
+
+    "bytetrack": {
+      "track_thresh": 0.5,
+      "_track_thresh_comment": "高置信度追踪阈值",
+
+      "match_thresh": 0.8,
+      "_match_thresh_comment": "IOU 匹配阈值",
+
+      "frame_rate": 30,
+      "_frame_rate_comment": "视频帧率，影响速度估计",
+
+      "track_buffer": 30,
+      "_track_buffer_comment": "目标丢失后保持追踪的帧数",
+
+      "min_box_area": 100,
+      "_min_box_area_comment": "最小目标面积（像素²），过滤噪声"
+    }
+  },
+
+  "debug": {
+    "_comment": "调试选项",
+    "enable_mock_device": false,
+    "save_debug_images": false,
+    "debug_image_directory": "debug",
+    "verbose_logging": false
+  }
+}

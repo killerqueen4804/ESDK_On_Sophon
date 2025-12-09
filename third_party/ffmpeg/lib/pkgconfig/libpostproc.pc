@@ -1,0 +1,14 @@
+prefix=/data/Edge-SDK/third_party/ffmpeg/
+exec_prefix=${prefix}
+libdir=/data/Edge-SDK/third_party/ffmpeg//lib
+includedir=/data/Edge-SDK/third_party/ffmpeg//include
+
+Name: libpostproc
+Description: FFmpeg postprocessing library
+Version: 55.3.100
+Requires: 
+Requires.private: libavutil >= 56.22.100
+Conflicts:
+Libs: -L${libdir}  -lpostproc 
+Libs.private: -lm
+Cflags: -I${includedir}

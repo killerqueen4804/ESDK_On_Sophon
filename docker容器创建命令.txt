@@ -1,0 +1,1 @@
+docker run -it --name stream_lzy -v 'F:\CV\DJI\ESDK_On_Sophon\ESDK_On_Sophon:/workspace' -w /workspace esdk-sop:latest /bin/bash

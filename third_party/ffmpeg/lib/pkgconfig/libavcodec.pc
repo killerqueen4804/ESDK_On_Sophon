@@ -1,0 +1,14 @@
+prefix=/data/Edge-SDK/third_party/ffmpeg/
+exec_prefix=${prefix}
+libdir=/data/Edge-SDK/third_party/ffmpeg//lib
+includedir=/data/Edge-SDK/third_party/ffmpeg//include
+
+Name: libavcodec
+Description: FFmpeg codec library
+Version: 58.35.100
+Requires: 
+Requires.private: libswresample >= 3.3.100, libavutil >= 56.22.100
+Conflicts:
+Libs: -L${libdir}  -lavcodec 
+Libs.private: -pthread -lm -llzma -lz -lmp3lame -lm -lx264 -pthread -lm
+Cflags: -I${includedir}

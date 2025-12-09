@@ -1,0 +1,22 @@
+/**
+ * @file Application.cpp
+ * @brief 应用程序主类实现
+ * @author ESDK_Sophon Team
+ * @date 2025-10-24
+ */
+
+#include "esdk_sophon/core/Application.h"
+
+namespace esdk_sophon {
+namespace core {
+
+// TODO: 实现Application类
+// 
+// 功能：
+// 1. 初始化所有模块（Logger、Config等）
+// 2. 管理应用程序生命周期
+// 3. 提供统一的启动/停止接口
+// 4. 外观模式：简化模块间协调
+
+}  // namespace core
+}  // namespace esdk_sophon

@@ -1,0 +1,14 @@
+prefix=/root/workspace/install
+exec_prefix=${prefix}
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+
+Name: Qt5 UiTools
+Description: Qt UiTools module
+Version: 5.14.0
+Libs: -L${libdir} -lQt5UiTools 
+Libs.private: /root/workspace/install/lib/libQt5Widgets.so /root/workspace/install/lib/libQt5Gui.so /root/workspace/install/lib/libQt5Core.so -lpthread /root/workspace/install/lib/libQt5Widgets.so /root/workspace/install/lib/libQt5Gui.so /root/workspace/install/lib/libQt5Core.so   
+Cflags: -DQT_UITOOLS_LIB -I${includedir}/QtUiTools -I${includedir}
+Requires: Qt5Core Qt5Gui Qt5Widgets
+

@@ -1,0 +1,14 @@
+prefix=/data/Edge-SDK/third_party/ffmpeg/
+exec_prefix=${prefix}
+libdir=/data/Edge-SDK/third_party/ffmpeg//lib
+includedir=/data/Edge-SDK/third_party/ffmpeg//include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 56.22.100
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil 
+Libs.private: -pthread -lm
+Cflags: -I${includedir}

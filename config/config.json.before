@@ -41,9 +41,9 @@
     "_comment": "视觉检测器配置",
     "ppyoloe": {
       "_comment": "PP-YOLOE目标检测模型 (PaddleDetection)",
-      "model_path": "/data/Edge-SDK/models/PaddleDetection/hit_uav/ppyoloe_crn_m_300e_hit_uav.bmodel",
-      "config_path": "/data/Edge-SDK/models/PaddleDetection/hit_uav/infer_cfg.yml",
-      "labels_path": "/data/Edge-SDK/models/PaddleDetection/hit_uav/coco.names",
+      "model_path": "/data/Edge-SDK/models/PaddleDetection/ppyoloe_crn_m_300e_coco_289.bmodel",
+      "config_path": "/data/Edge-SDK/models/PaddleDetection/infer_cfg.yml",
+      "labels_path": "/data/Edge-SDK/models/coco.names",
       "confidence_threshold": 0.25,
       "nms_threshold": 0.45,
       "input_size": [640, 640],
@@ -67,20 +67,6 @@
       "config_path": "/data/Edge-SDK/models/paddleSeg/deploy.yaml",
       "num_classes": 21,
       "input_size": [512, 512]
-    },
-    "sam2": {
-      "_comment": "SAM2 (Segment Anything Model 2) - 基于检测框的精细分割",
-      "enabled": true,
-      "encoder_model_path": "/data/Edge-SDK/models/SAM2/image_encoder/sam2_encoder_f16_1b.bmodel",
-      "_encoder_comment": "SAM2 Encoder 模型 - 提取图像特征",
-      "decoder_model_path": "/data/Edge-SDK/models/SAM2/image_encoder/sam2_decoder_f16_1b.bmodel",
-      "_decoder_comment": "SAM2 Decoder 模型 - 基于 Prompt 生成掩码",
-      "input_size": 1024,
-      "_input_size_comment": "SAM2 固定输入尺寸 1024x1024",
-      "use_box_prompt": true,
-      "_use_box_prompt_comment": "使用检测框中心点作为 Prompt",
-      "iou_threshold": 0.5,
-      "_iou_threshold_comment": "IOU 阈值，用于选择最佳掩码"
     }
   },
 
@@ -88,7 +74,7 @@
     "_comment": "GeoDecodeAPI 配置 - 用于计算检测框的 GPS 坐标",
     "api_url": "http://127.0.0.1:8122/geoDecode/arithmetic/getLonLatByPoints",
     "media_file_directory": "/data/Edge-SDK/build/bin",
-    "timeout_ms": 5000,
+    "timeout_ms": 50000,
     "_note": "media_file_directory 是媒体文件下载目录的绝对路径"
   },
 
@@ -192,10 +178,10 @@
     "_enabled_comment": "是否启用检测到目标后自动变焦拍照",
 
     "trigger": {
-      "min_target_count": 3,
+      "min_target_count": 1,
       "_min_target_count_comment": "触发拍照的最小目标数量",
 
-      "stable_frame_count": 5,
+      "stable_frame_count": 3,
       "_stable_frame_count_comment": "需要连续稳定检测到目标的帧数",
 
       "min_confidence": 0.5,
@@ -203,7 +189,7 @@
     },
 
     "cooldown": {
-      "time_seconds": 30.0,
+      "time_seconds": 60.0,
       "_time_seconds_comment": "时间冷却（秒），避免重复拍照",
 
       "distance_meters": 50.0,

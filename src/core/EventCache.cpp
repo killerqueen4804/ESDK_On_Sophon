@@ -23,6 +23,7 @@
 #include <sstream>
 #include <chrono>
 #include <algorithm>
+#include <thread>
 
 namespace esdk_sophon {
 namespace core {
@@ -35,10 +36,12 @@ EventCache& EventCache::getInstance() {
 }
 
 EventCache::EventCache()
-    : logger_(Logger::getInstance())
+    // ⚠️ 注意：成员变量的初始化顺序由头文件中的声明顺序决定，而不是由这里的书写顺序决定。
+    // 为消除 -Wreorder 警告，这里按 EventCache.h 中的声明顺序显式排列初始化列表。
+    : cacheFilePath_("/tmp/mqtt_event_cache.json")
     , maxRetryCount_(5)
     , maxEventAge_(3600)
-    , cacheFilePath_("/tmp/mqtt_event_cache.json") {
+    , logger_(Logger::getInstance()) {
     
     logger_.info("📦 EventCache 初始化完成");
     
@@ -106,8 +109,26 @@ bool EventCache::publishEvent(const std::string& topic, const nlohmann::json& ev
 }
 
 void EventCache::onMqttReconnected() {
-    logger_.info("🔄 MQTT 重连成功，开始重试缓存事件");
-    retryAll();
+    logger_.info("🔄 MQTT 重连成功，准备异步重试缓存事件（后台线程）");
+
+    // 为避免在调用线程中阻塞（可能导致任务线程停滞），
+    // 将重试操作放到后台线程执行。
+    try {
+        std::thread([this]() {
+            // 后台线程执行，捕获异常并在日志中记录
+            try {
+                retryAll();
+            } catch (const std::exception& e) {
+                logger_.error(std::string("后台重试事件线程异常: ") + e.what());
+            } catch (...) {
+                logger_.error("后台重试事件线程发生未知异常");
+            }
+        }).detach();
+    } catch (const std::exception& e) {
+        logger_.error(std::string("启动后台重试线程失败: ") + e.what());
+        // 退回到同步重试以保证事件不丢失
+        retryAll();
+    }
 }
 
 int EventCache::retryAll() {

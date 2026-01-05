@@ -286,9 +286,13 @@ foreach(lib ${SOPHON_LIBS})
     add_library(ThirdParty::${lib} SHARED IMPORTED GLOBAL)
     set_target_properties(ThirdParty::${lib} PROPERTIES
         IMPORTED_LOCATION "${THIRD_PARTY_ROOT}/soc-sdk/lib/lib${lib}.so"
+        INTERFACE_INCLUDE_DIRECTORIES "${THIRD_PARTY_ROOT}/soc-sdk/include"  # 添加头文件路径
     )
     target_link_libraries(ThirdParty::SophonSDK INTERFACE ThirdParty::${lib})
 endforeach()
+
+# bmlib 依赖 libdl (提供 dlopen, dlsym, dlerror)
+target_link_libraries(ThirdParty::bmlib INTERFACE ${CMAKE_DL_LIBS})
 
 message(STATUS "  ✓ Sophon SDK 已配置 (${SOPHON_LIBS})")
 

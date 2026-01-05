@@ -18,6 +18,7 @@
 #include "esdk_sophon/core/Config.h"       // 配置管理（用于获取 GeoDecodeAPI 配置）
 #include "esdk_sophon/vision/DetectorFactory.h"  // 检测器工厂
 #include "esdk_sophon/vision/IDetector.h"        // 检测器接口
+#include "esdk_sophon/vision/segmentation/Sam2Segmentor.h"  // SAM2 分割器
 #include "esdk_sophon/vision/VisionConfigLoader.h" // 配置加载器
 #include "esdk_sophon/vision/VisionUtils.h"      // 可视化工具（绘制检测框）
 #include <nlohmann/json.hpp>
@@ -27,12 +28,34 @@
 #include <chrono>
 #include <ctime>
 #include <cmath>
+#include <limits>
+#ifdef _WIN32
+#include <direct.h>  // _mkdir
+#include <sys/stat.h>  // _stat
+#else
+#include <sys/stat.h>   // mkdir
+#include <sys/types.h>
+#endif
 #include <unordered_map>
 #include <mutex>
 #include <cstdio>  // std::remove (删除文件)
+#include <fstream> // std::ifstream (文件检查)
+
+#include "esdk_sophon/vision/VisionConfigLoader.h"  // 用于从labels_path读取类别名称(避免写死COCO)
 
 namespace esdk_sophon {
 namespace task {
+
+// ============================================================================
+// 平台兼容：Windows 与 Linux 在 stat/_stat 的类型与函数名上有差异
+// ============================================================================
+#ifdef _WIN32
+using StatStruct = struct _stat;
+static inline int statCompat(const char* path, StatStruct* st) { return ::_stat(path, st); }
+#else
+using StatStruct = struct stat;
+static inline int statCompat(const char* path, StatStruct* st) { return ::stat(path, st); }
+#endif
 
 // ==================== Pimpl 实现类 ====================
 
@@ -51,6 +74,11 @@ struct TaskService::Impl {
     std::unique_ptr<vision::IDetector> detector;  ///< 目标检测器
     std::mutex detectorMutex;                     ///< 保护检测器的互斥锁 (IDetector非线程安全)
     
+    // ===== SAM2 分割器 =====
+    std::unique_ptr<vision::Sam2Segmentor> sam2Segmentor;  ///< SAM2 语义分割器
+    bool useSam2;                                          ///< 是否启用 SAM2
+    std::mutex segmentorMutex;                             ///< 保护分割器的互斥锁
+    
     // ===== 上报时间记录 (用于限流) =====
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> lastReportTime;
     std::mutex reportTimeMutex;  ///< 保护 lastReportTime 的互斥锁
@@ -63,9 +91,10 @@ struct TaskService::Impl {
      */
     Impl(std::shared_ptr<mqtt::MqttClient> m)
         : mqtt(m)
+        , useSam2(false)
         , logger(core::Logger::getInstance())
     {
-        // 初始化检测器
+        // ===== 1. 初始化目标检测器 =====
         try {
             vision::VisionConfigLoader loader;
             // 默认加载 PPYOLOE 配置
@@ -81,7 +110,64 @@ struct TaskService::Impl {
             // 不抛出异常，允许服务在无检测器的情况下运行（降级）
         }
         
-        logger.info("TaskService::Impl 初始化完成");
+        // ===== 2. 初始化 SAM2 分割器 =====
+        try {
+            auto& config = core::Config::getInstance();
+            
+            // 读取 SAM2 配置
+            bool enabled = config.getBool("segmentation.sam2.enabled", false);
+            
+            logger.info("🔧 [SAM2 初始化] enabled=" + std::string(enabled ? "true" : "false"));
+            
+            if (enabled) {
+                std::string encoderPath = config.getString("segmentation.sam2.encoder_model_path");
+                std::string decoderPath = config.getString("segmentation.sam2.decoder_model_path");
+                int deviceId = config.getInt("segmentation.sam2.device_id", 0);
+                
+                logger.info("🔧 [SAM2 初始化] 正在加载模型...");
+                logger.info("  📦 Encoder: " + encoderPath);
+                logger.info("  📦 Decoder: " + decoderPath);
+                logger.info("  🔌 Device ID: " + std::to_string(deviceId));
+                
+                // 检查文件是否存在
+                std::ifstream encoderFile(encoderPath);
+                std::ifstream decoderFile(decoderPath);
+                if (!encoderFile.good()) {
+                    logger.error("❌ [SAM2 初始化] Encoder 模型文件不存在: " + encoderPath);
+                    useSam2 = false;
+                    logger.info("SAM2 分割器初始化完成 (已禁用)");
+                    return;
+                }
+                if (!decoderFile.good()) {
+                    logger.error("❌ [SAM2 初始化] Decoder 模型文件不存在: " + decoderPath);
+                    useSam2 = false;
+                    logger.info("SAM2 分割器初始化完成 (已禁用)");
+                    return;
+                }
+                
+                // 创建分割器
+                sam2Segmentor = std::make_unique<vision::Sam2Segmentor>();
+                
+                // 初始化 (modelPath=encoder, configPath=decoder)
+                logger.info("🚀 [SAM2 初始化] 正在调用 init()...");
+                if (!sam2Segmentor->init(encoderPath, decoderPath)) {
+                    logger.error("❌ [SAM2 初始化] init() 返回 false (模型加载失败)");
+                    sam2Segmentor.reset();  // 释放资源
+                    useSam2 = false;
+                } else {
+                    useSam2 = true;
+                    logger.info("✅ [SAM2 初始化] 初始化成功! useSam2=" + std::string(useSam2 ? "true" : "false"));
+                }
+            } else {
+                logger.info("ℹ️ [SAM2 初始化] 配置文件中已禁用 (segmentation.sam2.enabled=false)");
+                useSam2 = false;
+            }
+        } catch (const std::exception& e) {
+            logger.error("❌ [SAM2 初始化] 异常: " + std::string(e.what()));
+            useSam2 = false;
+        }
+        
+        logger.info("TaskService::Impl 初始化完成 (useSam2=" + std::string(useSam2 ? "true" : "false") + ")");
     }
     
     /**
@@ -133,23 +219,13 @@ TaskService& TaskService::operator=(TaskService&&) noexcept = default;
 // ==================== 核心业务方法 ====================
 
 /**
- * @brief 处理单帧图像 - 完整业务流程 ⭐
+ * @brief 处理单帧图像 - 完整业务流程 (算法路由入口) ⭐
  * 
- * 这是 TaskService 的核心方法,编排了完整的帧处理流程。
+ * 这是 TaskService 的核心方法,根据算法类型路由到不同的处理函数。
  * 
- * 流程:
- * 1. 目标检测 (Vision::detect)
- * 2. 过滤目标 (只保留关心的类别)
- * 3. 检查上报间隔 (限流)
- * 4. 构建事件 (图像编码、GPS 转换等)
- * 5. 发布事件 (MQTT)
- * 
- * 性能分析:
- * - detectObjects: ~50ms (TPU 推理)
- * - filterByEventTypes: ~1ms (遍历)
- * - buildEvent: ~15ms (JPEG 编码 + Base64)
- * - publishEvent: ~2ms (MQTT)
- * - 总计: ~68ms (约 15 FPS)
+ * 路由规则:
+ * - main_type = 100000 → processDetection() (目标检测)
+ * - main_type = 100001 → processSegmentation() (语义分割)
  * 
  * @param frame 输入图像帧
  * @param config 任务配置
@@ -160,37 +236,140 @@ TaskService& TaskService::operator=(TaskService&&) noexcept = default;
 bool TaskService::processFrame(const cv::Mat& frame, 
                               const TaskConfig& config,
                               std::vector<BoundingBox>& outBoxes,
-                              const std::string& fileName) {
+                              const std::string& fileName,
+                              const device::GpsPosition* gpsSnapshot) {
+    try {
+        // 1. 检查配置有效性
+        if (config.eventTypes.empty()) {
+            impl_->logger.error("❌ [TaskService] eventTypes 为空: taskId=" + config.taskId);
+            return false;
+        }
+        
+        // 2. 获取算法类型
+        int mainType = config.eventTypes[0].mainType;
+        
+        // 3. 根据算法类型路由到不同的处理函数
+        if (mainType == 100000) {
+            // 目标检测 (返回矩形框)
+            // 说明：gpsSnapshot 仅用于直播流“帧时刻经纬度”填充。
+            return processDetection(frame, config, outBoxes, fileName, gpsSnapshot);
+            
+        } else if (mainType == 100001) {
+            // 语义分割 (返回多边形)
+            return processSegmentation(frame, config, outBoxes, fileName, gpsSnapshot);
+            
+        } else {
+            impl_->logger.error("❌ [TaskService] 未知的 main_type: " + 
+                               std::to_string(mainType) + ", taskId=" + config.taskId);
+            return false;
+        }
+        
+    } catch (const std::exception& e) {
+        impl_->logger.error("❌ [TaskService] processFrame 异常: " + std::string(e.what()));
+        return false;
+    }
+}
+
+/**
+ * @brief 处理检测任务 (main_type=100000)
+ * 
+ * 这是原 processFrame 的检测逻辑部分,
+ * 负责目标检测、过滤、事件构建和上报。
+ */
+bool TaskService::processDetection(const cv::Mat& frame, 
+                                   const TaskConfig& config,
+                                   std::vector<BoundingBox>& outBoxes,
+                                   const std::string& fileName,
+                                   const device::GpsPosition* gpsSnapshot) {
     // 📌 诊断日志：确认函数被调用
     static int callCount = 0;
     callCount++;
     if (callCount == 1 || callCount % 30 == 0) {
-        impl_->logger.info("🎬 [TaskService] processFrame 被调用 (第 " + std::to_string(callCount) + " 次): " +
+        impl_->logger.info("🎬 [检测任务] processDetection 被调用 (第 " + std::to_string(callCount) + " 次): " +
                           "taskId=" + config.taskId + ", 帧尺寸=" + 
-                          std::to_string(frame.cols) + "x" + std::to_string(frame.rows));
+                          std::to_string(frame.cols) + "x" + std::to_string(frame.rows) +
+                          ", fileName=" + fileName);
     }
     
     try {
         // 1. 目标检测
+        impl_->logger.info("🔍 [检测任务] 正在调用检测器... (taskId=" + config.taskId + ")");
         std::vector<BoundingBox> boxes;
         if (!detectObjects(frame, config, boxes)) {
-            impl_->logger.warning("❌ [TaskService] 检测器调用失败: taskId=" + config.taskId);
+            impl_->logger.warning("❌ [检测任务] 检测器调用失败: taskId=" + config.taskId + ", fileName=" + fileName);
             return false;
         }
         
-        impl_->logger.debug("✅ [TaskService] 检测器返回 " + std::to_string(boxes.size()) + " 个原始检测框");
+        impl_->logger.info("✅ [检测任务] 检测器返回 " + std::to_string(boxes.size()) + 
+                          " 个原始检测框 (taskId=" + config.taskId + ", fileName=" + fileName + ")");
+        
+        // 打印所有检测框详情 (DEBUG级别)
+        if (!boxes.empty()) {
+            impl_->logger.debug("📋 [检测任务] 原始检测框详情:");
+            for (size_t i = 0; i < boxes.size() && i < 10; ++i) {  // 最多打印10个
+                const auto& box = boxes[i];
+                impl_->logger.debug("  [" + std::to_string(i) + "] " + box.className + 
+                                   " (ID=" + std::to_string(box.classId) + 
+                                   ", conf=" + std::to_string(box.confidence) + 
+                                   ", box=" + std::to_string(box.x) + "," + std::to_string(box.y) + 
+                                   "," + std::to_string(box.w) + "x" + std::to_string(box.h) + ")");
+            }
+            if (boxes.size() > 10) {
+                impl_->logger.debug("  ... 还有 " + std::to_string(boxes.size() - 10) + " 个检测框未显示");
+            }
+        }
         
         // 2. 过滤目标 (只保留关心的类别)
+        // 说明：云端下发通常是类别“名称”，TaskConfig::fromJson 已经基于 labels_path 做过 name->id 映射。
+        //      这里打印更友好的日志：优先输出类别名称（来自 labels_path/coco.names），并同时输出关注ID。
+        impl_->logger.info("🔍 [检测任务] 正在过滤目标类别... (关注类别: " +
+                          [&config]() {
+                              // 收集关注ID
+                              std::set<int> targetClassIds;
+                              for (const auto& et : config.eventTypes) {
+                                  for (int id : et.classIds) {
+                                      targetClassIds.insert(id);
+                                  }
+                              }
+
+                              if (targetClassIds.empty()) {
+                                  return std::string("无");
+                              }
+
+                              // 读取labels(例如 coco.names)，把ID映射回名称用于展示
+                              std::vector<std::string> classes;
+                              try {
+                                  vision::VisionConfigLoader loader;
+                                  vision::DetectorConfig detCfg = loader.loadDetectorConfig("ppyoloe");
+                                  classes = detCfg.classes;
+                              } catch (...) {
+                                  // 读取失败不影响主流程，只是日志里显示不出名称
+                              }
+
+                              std::string text;
+                              for (int id : targetClassIds) {
+                                  if (!text.empty()) text += ", ";
+                                  if (!classes.empty() && id >= 0 && id < static_cast<int>(classes.size())) {
+                                      text += classes[static_cast<size_t>(id)] + "(ID=" + std::to_string(id) + ")";
+                                  } else {
+                                      text += "ID=" + std::to_string(id);
+                                  }
+                              }
+                              return text;
+                          }() + ")");
+        
         boxes = filterByEventTypes(boxes, config);
         
-        impl_->logger.debug("🔍 [TaskService] 过滤后剩余 " + std::to_string(boxes.size()) + " 个目标框");
+        impl_->logger.info("🔍 [检测任务] 过滤后剩余 " + std::to_string(boxes.size()) + 
+                          " 个目标框 (taskId=" + config.taskId + ", fileName=" + fileName + ")");
         
         // 输出过滤后的结果供外部使用
         outBoxes = boxes;
         
         // 如果没有检测到目标,直接返回
         if (boxes.empty()) {
-            impl_->logger.debug("ℹ️ [TaskService] 未检测到关注的目标类别 (过滤后为空): taskId=" + config.taskId);
+            impl_->logger.info("ℹ️ [检测任务] 未检测到关注的目标类别 (过滤后为空): taskId=" + 
+                              config.taskId + ", fileName=" + fileName);
             return false;  // 注意: 这不是错误，只是没有检测到目标
         }
         
@@ -209,25 +388,288 @@ bool TaskService::processFrame(const cv::Mat& frame,
             return false;
         }
         
+        impl_->logger.info("📦 [检测任务] 正在构建事件...");
         DetectionEvent event = buildEvent(frame, boxes, config, config.eventTypes[0], fileName);
+
+        // 4.1 直播流：用“取帧时刻”的 GPS 覆盖事件顶层经纬度
+        // 说明：用户明确只需要顶层 longitude/latitude，bbox 里的 location 不需要管。
+        if (config.type == TaskType::DETECTION_LIVESTREAM) {
+            const double kNull = std::numeric_limits<double>::quiet_NaN();
+            const bool hasSnapshot = (gpsSnapshot != nullptr);
+            const bool snapshotValid = (gpsSnapshot != nullptr && gpsSnapshot->isValid());
+            impl_->logger.info(std::string("📍 [直播GPS] gpsSnapshot=") + (hasSnapshot ? "non-null" : "null") +
+                               ", snapshotValid=" + (snapshotValid ? "true" : "false"));
+
+            if (snapshotValid) {
+                event.latitude = gpsSnapshot->latitude;
+                event.longitude = gpsSnapshot->longitude;
+            } else {
+                // GPS 无效/未提供：按既定策略输出空值（序列化为 null）
+                event.latitude = kNull;
+                event.longitude = kNull;
+            }
+
+            if (std::isnan(event.latitude) || std::isnan(event.longitude)) {
+                impl_->logger.info("📍 [直播GPS] event(lat/lon) -> null (NaN)");
+            } else {
+                impl_->logger.info("📍 [直播GPS] event(lat/lon)=" + std::to_string(event.latitude) +
+                                   "," + std::to_string(event.longitude));
+            }
+        }
         
         // 5. 发布事件
-        // 📌 暂时注释掉视频流的事件推送功能
-        // 目前视频流任务只做检测，不向云端推送事件
-        // 如需恢复，取消下面的注释即可
-        /*
+        // ✅ 直播流任务也允许上报事件（受 shouldReportEvent 间隔限流保护），避免“视频流推事件被关掉”。
+        // 媒体文件任务本来就需要每张图上报；直播流任务通常需要限流，避免刷屏。
+        impl_->logger.info("📤 [检测任务] 正在发布事件到 MQTT... (taskType=" + std::to_string(static_cast<int>(config.type)) + ")");
         if (!publishEvent(event, config.deviceSn)) {
-            impl_->logger.error("发布事件失败: taskId=" + config.taskId);
+            impl_->logger.error("❌ [检测任务] 发布事件失败: taskId=" + config.taskId);
             return false;
         }
-        */
-        
-        impl_->logger.debug("成功处理帧: taskId=" + config.taskId + 
-                          ", 检测到 " + std::to_string(boxes.size()) + " 个目标 (事件推送已禁用)");
+        impl_->logger.info("✅ [检测任务] 成功处理帧: taskId=" + config.taskId +
+                          ", 检测到 " + std::to_string(boxes.size()) + " 个目标, fileName=" + fileName);
         return true;
         
     } catch (const std::exception& e) {
-        impl_->logger.error("processFrame 异常: " + std::string(e.what()));
+        impl_->logger.error("❌ [检测任务] processDetection 异常: " + std::string(e.what()));
+        return false;
+    }
+}
+
+/**
+ * @brief 处理分割任务 (main_type=100001)
+ * 
+ * 分割流程:
+ * 1. 检测获取候选框
+ * 2. SAM2 分割获取精细轮廓
+ * 3. 构建事件 (polygons 字段)
+ * 4. 上报 MQTT
+ */
+bool TaskService::processSegmentation(const cv::Mat& frame, 
+                                      const TaskConfig& config,
+                                      std::vector<BoundingBox>& outBoxes,
+                                      const std::string& fileName,
+                                      const device::GpsPosition* gpsSnapshot) {
+    static int callCount = 0;
+    callCount++;
+    if (callCount == 1 || callCount % 30 == 0) {
+        impl_->logger.info("🎨 [分割任务] processSegmentation 被调用 (第 " + std::to_string(callCount) + " 次): " +
+                          "taskId=" + config.taskId + ", 帧尺寸=" + 
+                          std::to_string(frame.cols) + "x" + std::to_string(frame.rows) +
+                          ", fileName=" + fileName);
+    }
+    
+    try {
+        // 0. 检查 SAM2 是否可用
+        impl_->logger.info("🔍 [分割任务] 检查 SAM2 状态... (useSam2=" + 
+                          std::string(impl_->useSam2 ? "true" : "false") + ")");
+        if (!impl_->useSam2) {
+            impl_->logger.warning("❌ [分割任务] SAM2 未启用,无法执行分割任务: taskId=" + 
+                                 config.taskId + ", fileName=" + fileName);
+            impl_->logger.warning("💡 请检查: 1) config.json中segmentation.sam2.enabled是否为true; " +
+                                 std::string("2) SAM2模型文件是否存在; 3) 程序启动日志中SAM2初始化是否成功"));
+            return false;
+        }
+        
+        // 1. 目标检测 (获取候选框)
+        impl_->logger.info("🔍 [分割任务] 正在调用检测器获取候选框...");
+        std::vector<BoundingBox> boxes;
+        if (!detectObjects(frame, config, boxes)) {
+            impl_->logger.warning("❌ [分割任务] 检测器调用失败: taskId=" + config.taskId + ", fileName=" + fileName);
+            return false;
+        }
+        
+        impl_->logger.info("✅ [分割任务] 检测器返回 " + std::to_string(boxes.size()) + 
+                          " 个候选框 (taskId=" + config.taskId + ", fileName=" + fileName + ")");
+        
+        // 2. 过滤目标 (只保留关心的类别)
+        boxes = filterByEventTypes(boxes, config);
+        
+        impl_->logger.info("🔍 [分割任务] 过滤后剩余 " + std::to_string(boxes.size()) + 
+                          " 个候选框 (taskId=" + config.taskId + ", fileName=" + fileName + ")");
+        
+        // 输出过滤后的结果供外部使用
+        outBoxes = boxes;
+        
+        // 如果没有检测到目标,直接返回
+        if (boxes.empty()) {
+            impl_->logger.info("ℹ️ [分割任务] 未检测到关注的目标类别: taskId=" + 
+                              config.taskId + ", fileName=" + fileName);
+            return false;
+        }
+        
+        // 3. SAM2 分割
+        impl_->logger.info("🎨 [分割任务] 正在调用 SAM2 进行分割...");
+        std::vector<vision::SegmentationResult> segResults;
+        {
+            std::lock_guard<std::mutex> lock(impl_->segmentorMutex);
+            
+            // 转换 BoundingBox → DetectionBox
+            std::vector<vision::DetectionBox> detBoxes;
+            for (const auto& box : boxes) {
+                vision::DetectionBox det;
+                det.x = box.x;
+                det.y = box.y;
+                det.width = box.w;   // BoundingBox 使用 w/h
+                det.height = box.h;  // DetectionBox 使用 width/height
+                det.classId = box.classId;
+                det.className = box.className;
+                det.confidence = box.confidence;
+                detBoxes.push_back(det);
+            }
+            
+            segResults = impl_->sam2Segmentor->segmentWithPrompts(frame, detBoxes);
+        }
+        
+        impl_->logger.info("✅ [分割任务] SAM2 分割返回 " + std::to_string(segResults.size()) + 
+                          " 个结果 (taskId=" + config.taskId + ", fileName=" + fileName + ")");
+        
+        // 如果分割失败,返回
+        if (segResults.empty()) {
+            impl_->logger.warning("❌ [分割任务] SAM2 分割未返回有效结果: taskId=" + 
+                                 config.taskId + ", fileName=" + fileName);
+            return false;
+        }
+        
+        // 4. 检查上报间隔
+        if (config.type == TaskType::DETECTION_LIVESTREAM) {
+            if (!shouldReportEvent(config.taskId, config.reportIntervalSec)) {
+                impl_->logger.debug("上报间隔未到: taskId=" + config.taskId);
+                return false;
+            }
+        }
+        
+        // 5. 构建分割事件
+        impl_->logger.info("📦 [分割任务] 正在构建分割事件...");
+        DetectionEvent event = buildSegmentationEvent(frame, segResults, config, config.eventTypes[0], fileName);
+
+        // 5.1 直播流：用“取帧时刻”的 GPS 覆盖事件顶层经纬度
+        // 说明：bboxes/polygons 里的 location 不要求填充。
+        if (config.type == TaskType::DETECTION_LIVESTREAM) {
+            const double kNull = std::numeric_limits<double>::quiet_NaN();
+            if (gpsSnapshot != nullptr && gpsSnapshot->isValid()) {
+                event.latitude = gpsSnapshot->latitude;
+                event.longitude = gpsSnapshot->longitude;
+            } else {
+                event.latitude = kNull;
+                event.longitude = kNull;
+            }
+        }
+        
+        // 6. 保存分割可视化图片到本地 (用于调试和验证)
+        try {
+            // 生成可视化图片 (在原图上绘制轮廓和bbox)
+            cv::Mat visFrame = frame.clone();
+            
+            // 绘制每个分割对象
+            for (size_t i = 0; i < segResults.size(); ++i) {
+                const auto& result = segResults[i];
+                
+                // 🎨 绘制半透明彩色 mask
+                if (!result.mask.empty() && result.mask.rows == frame.rows && result.mask.cols == frame.cols) {
+                    // 生成随机颜色
+                    cv::Scalar color(rand() % 200 + 55, rand() % 200 + 55, rand() % 200 + 55);
+                    
+                    // ⚠️ 重要: result.mask 可能是 CV_32F,需要转换为 CV_8U
+                    cv::Mat mask8u;
+                    if (result.mask.type() != CV_8U) {
+                        result.mask.convertTo(mask8u, CV_8U, 255.0);  // [0,1] → [0,255]
+                    } else {
+                        mask8u = result.mask;
+                    }
+                    
+                    // 创建彩色遮罩
+                    cv::Mat coloredMask = cv::Mat::zeros(visFrame.size(), visFrame.type());
+                    coloredMask.setTo(color, mask8u);
+                    
+                    // 半透明叠加 (alpha = 0.6)
+                    cv::addWeighted(visFrame, 1.0, coloredMask, 0.6, 0.0, visFrame);
+                    
+                } else if (!result.contours.empty()) {
+                    // 如果没有原始 mask,使用轮廓填充
+                    cv::Scalar color(rand() % 200 + 55, rand() % 200 + 55, rand() % 200 + 55);
+                    
+                    cv::Mat tempMask = cv::Mat::zeros(visFrame.size(), CV_8UC1);
+                    std::vector<std::vector<cv::Point>> contours = {result.contours};
+                    cv::drawContours(tempMask, contours, 0, cv::Scalar(255), cv::FILLED);
+                    
+                    cv::Mat coloredMask = cv::Mat::zeros(visFrame.size(), visFrame.type());
+                    coloredMask.setTo(color, tempMask);
+                    
+                    cv::addWeighted(visFrame, 1.0, coloredMask, 0.6, 0.0, visFrame);
+                }
+                
+                // 绘制检测框 (绿色)
+                cv::Rect rect(result.box.x, result.box.y, result.box.width, result.box.height);
+                cv::rectangle(visFrame, rect, cv::Scalar(0, 255, 0), 2);
+                
+                // 绘制类别标签 (绿色文字)
+                std::string label = result.className + " (" + std::to_string((int)(result.confidence * 100)) + "%)";
+                cv::putText(visFrame, label, 
+                           cv::Point(result.box.x, result.box.y - 10),
+                           cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+            }
+            
+            // 保存到文件
+            std::string outputDir = "/data/Edge-SDK/build/bin/";
+            
+            // 确保目录存在（跨平台创建目录）
+            StatStruct info;
+            if (statCompat(outputDir.c_str(), &info) != 0) {
+                // 目录不存在,创建目录
+                #ifdef _WIN32
+                    ::_mkdir(outputDir.c_str());
+                #else
+                    mkdir(outputDir.c_str(), 0755);
+                #endif
+            }
+            
+            // 生成文件名: seg_<taskID>_<timestamp>.jpg
+            auto now = std::chrono::system_clock::now();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+            std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+            std::tm tm;
+            #ifdef _WIN32
+                localtime_s(&tm, &now_c);
+            #else
+                localtime_r(&now_c, &tm);
+            #endif
+            
+            std::ostringstream oss;
+            oss << outputDir 
+                << "seg_" << config.taskId  // 使用 taskId (string类型)
+                << "_" << std::put_time(&tm, "%Y%m%d_%H%M%S")
+                << "_" << std::setfill('0') << std::setw(3) << ms.count()
+                << ".jpg";
+            std::string outputPath = oss.str();
+            
+            // 保存图片
+            if (cv::imwrite(outputPath, visFrame)) {
+                impl_->logger.info("🎨 [分割可视化] 已保存: " + outputPath + 
+                                  " (共 " + std::to_string(segResults.size()) + " 个对象)");
+            } else {
+                impl_->logger.warning("⚠️ [分割可视化] 保存失败: " + outputPath);
+            }
+            
+        } catch (const std::exception& e) {
+            impl_->logger.error("❌ [分割可视化] 保存异常: " + std::string(e.what()));
+            // 可视化保存失败不影响主流程,继续执行
+        }
+        
+        // 7. 发布事件
+        // ✅ 直播流分割任务也允许上报事件（仍受 shouldReportEvent 间隔限流保护）
+        impl_->logger.info("📤 [分割任务] 正在发布事件到 MQTT... (taskType=" + std::to_string(static_cast<int>(config.type)) + ")");
+        if (!publishEvent(event, config.deviceSn)) {
+            impl_->logger.error("❌ [分割任务] 发布事件失败: taskId=" + config.taskId);
+            return false;
+        }
+        impl_->logger.info("✅ [分割任务] 成功处理分割帧: taskId=" + config.taskId +
+                          ", 分割 " + std::to_string(segResults.size()) + " 个目标, fileName=" + fileName);
+        return true;
+        
+    } catch (const std::exception& e) {
+        impl_->logger.error("❌ [分割任务] processSegmentation 异常: " + std::string(e.what()));
+        return false;
+        impl_->logger.error("processSegmentation 异常: " + std::string(e.what()));
         return false;
     }
 }
@@ -313,56 +755,20 @@ DetectionEvent TaskService::buildEvent(const cv::Mat& frame,
     try {
         // 1. 基本信息
         event.uuid = generateUUID();
-        event.taskId = config.taskId;
+        event.taskID = std::stoi(config.taskId);  // string → int 转换
         event.eventType = eventType.id;
-        event.mainType = eventType.mainType;
+        event.main_type = eventType.mainType;  // 字段名改为 main_type
         event.eventDescribe = eventType.eventDescribe;
-        
-        // 2. 图像编码（⭐ 关键优化：缩小图片尺寸避免 Base64 过大）
-        // 原图 4032x3024 → 压缩到 800x600（约 100KB）
-        // 避免 Base64 编码耗时过长导致 MQTT 心跳超时
+        event.fileName = fileName; // 保存文件名
+
+        // 2. 图像编码 - 已废弃 (接口更新：不再上报图片数据)
+        // 为了节省性能，不再进行图片缩放、绘制和编码
+        /*
         cv::Mat resizedFrame;
         const int MAX_WIDTH = 800;
         const int MAX_HEIGHT = 600;
         
-        // 计算缩放比例
-        double scale = 1.0;
-        if (frame.cols > MAX_WIDTH || frame.rows > MAX_HEIGHT) {
-            scale = std::min(
-                static_cast<double>(MAX_WIDTH) / frame.cols,
-                static_cast<double>(MAX_HEIGHT) / frame.rows
-            );
-            
-            int newWidth = static_cast<int>(frame.cols * scale);
-            int newHeight = static_cast<int>(frame.rows * scale);
-            
-            cv::resize(frame, resizedFrame, cv::Size(newWidth, newHeight), 0, 0, cv::INTER_LINEAR);
-            
-            impl_->logger.debug("图片缩放: " + std::to_string(frame.cols) + "x" + std::to_string(frame.rows) + 
-                              " → " + std::to_string(newWidth) + "x" + std::to_string(newHeight));
-        } else {
-            resizedFrame = frame.clone();  // 克隆，因为后续要在上面画框
-        }
-        
-        // ⭐ 绘制检测框可视化
-        // 将检测框坐标按缩放比例调整后绘制
-        if (!boxes.empty()) {
-            std::vector<BoundingBox> scaledBoxes;
-            scaledBoxes.reserve(boxes.size());
-            
-            for (const auto& box : boxes) {
-                BoundingBox scaledBox = box;
-                scaledBox.x = static_cast<float>(box.x * scale);
-                scaledBox.y = static_cast<float>(box.y * scale);
-                scaledBox.w = static_cast<float>(box.w * scale);
-                scaledBox.h = static_cast<float>(box.h * scale);
-                scaledBoxes.push_back(scaledBox);
-            }
-            
-            // 调用 VisionUtils 的可视化方法
-            vision::VisionUtils::drawDetections(resizedFrame, scaledBoxes);
-            impl_->logger.debug("检测框可视化完成: 绘制了 " + std::to_string(boxes.size()) + " 个框");
-        }
+        // ... (省略图片处理代码) ...
         
         std::vector<uint8_t> jpegBuffer;
         if (encodeImageToJPEG(resizedFrame, 85, jpegBuffer)) {
@@ -374,6 +780,8 @@ DetectionEvent TaskService::buildEvent(const cv::Mat& frame,
         } else {
             impl_->logger.warning("图像编码失败,将不包含图片");
         }
+        */
+        impl_->logger.debug("接口更新: 跳过图片编码步骤");
         
         // 3. 时间戳（格式：yyyy-mm-dd hh:mm:ss）
         event.createTime = getCurrentTimeString();
@@ -397,62 +805,466 @@ DetectionEvent TaskService::buildEvent(const cv::Mat& frame,
         }
         
         if (!calculateGPSCoordinates(frame, boxes, event, imagePath)) {
-            // GPS 计算失败，使用降级方案
-            impl_->logger.warning("GPS 计算失败，使用降级方案（pixelToGPS）");
-            
-            // 降级方案：使用无人机GPS + 像素偏移估算
-            // TODO: 从 device 模块获取真实的无人机 GPS 和高度
-            double droneLatitude = 31.230391;   // 临时假设值
-            double droneLongitude = 121.473701;
-            double droneAltitude = 100.0;       // 假设飞行高度 100米
-            double droneYaw = 0.0;              // 假设航向角 0度
-            
-            // 计算每个检测框的 GPS 坐标
-            double sumLat = 0.0, sumLon = 0.0;
-            int validCount = 0;
-            
+            // ✅ 按需求：经纬度计算失败时直接返回“空值”，不要降级估算。
+            // 原因：降级方案（pixelToGPS/假无人机坐标）会产生“看似合理但实际错误”的坐标，
+            //      云端一旦用这些坐标做业务（告警/地图标注）风险更大。
+            impl_->logger.warning("GPS 计算失败：将经纬度置为空值(不做降级估算)");
+
+            // 约定：用 NaN 作为“空值哨兵”。
+            // 后续在 eventToJson 序列化时，将 NaN 输出为 JSON null（更符合‘空值’含义）。
+            const double kNull = std::numeric_limits<double>::quiet_NaN();
+
+            event.latitude = kNull;
+            event.longitude = kNull;
+            event.points.clear();
+            event.points.reserve(boxes.size());
             for (const auto& box : boxes) {
                 BoundingBox eventBox = box;
-                
-                // 计算检测框中心点的像素坐标
-                float centerX = box.x + box.w / 2.0f;
-                float centerY = box.y + box.h / 2.0f;
-                
-                // 转换为 GPS 坐标
-                double targetLat, targetLon;
-                if (pixelToGPS(centerX, centerY,
-                              frame.cols, frame.rows,
-                              droneLatitude, droneLongitude,
-                              droneAltitude, droneYaw,
-                              targetLat, targetLon)) {
-                    eventBox.lat = targetLat;
-                    eventBox.lon = targetLon;
-                    
-                    sumLat += targetLat;
-                    sumLon += targetLon;
-                    validCount++;
-                }
-                
+                eventBox.lat = kNull;
+                eventBox.lon = kNull;
                 event.points.push_back(eventBox);
-            }
-            
-            // 设置事件坐标为平均值
-            if (validCount > 0) {
-                event.latitude = sumLat / validCount;
-                event.longitude = sumLon / validCount;
-            } else {
-                // 所有坐标都无效，使用无人机坐标
-                event.latitude = droneLatitude;
-                event.longitude = droneLongitude;
             }
         }
         // 注意：如果 calculateGPSCoordinates() 成功，
         // event.points 已经在函数内部填充了，这里不需要再处理
         
+        // 5. 填充 objects 数组 (新接口要求)
+        // 将 BoundingBox 转换为 DetectedObject
+        event.objects.clear();
+        event.objects.reserve(boxes.size());
+        
+        for (size_t i = 0; i < boxes.size(); ++i) {
+            const auto& box = boxes[i];
+            
+            DetectionEvent::DetectedObject obj;
+            obj.label = box.className;  // 类别名称
+            
+            // 填充 bbox
+            obj.bbox.x = static_cast<int>(box.x);
+            obj.bbox.y = static_cast<int>(box.y);
+            obj.bbox.w = static_cast<int>(box.w);
+            obj.bbox.h = static_cast<int>(box.h);
+            
+            // 填充 bbox 的 GPS location (如果已计算)
+            if (i < event.points.size()) {
+                obj.bbox.location.lon = event.points[i].lon;
+                obj.bbox.location.lat = event.points[i].lat;
+            } else {
+                // 降级方案：使用事件的平均 GPS
+                obj.bbox.location.lon = event.longitude;
+                obj.bbox.location.lat = event.latitude;
+            }
+            
+            // 目标检测任务没有 mask,留空
+            obj.mask.clear();
+            
+            event.objects.push_back(obj);
+        }
+        
+        impl_->logger.debug("已填充 objects 数组: " + std::to_string(event.objects.size()) + " 个对象");
+        
+        // 6. 生成 resultImage (Base64 编码)
+        // ✅ 直播流推送事件必须包含“推理后可视化图片”，与媒体文件分析对齐：在图上画框再编码。
+        // 这里统一使用 VisionUtils::drawDetections，避免两套绘制逻辑不一致。
+        cv::Mat visFrame = frame.clone();
+
+        // 6.1 先绘制（基于原图尺寸的 boxes 坐标）
+        // 注意：vision::BBox 现在是 task::BoundingBox 的别名，可直接传 boxes
+        vision::VisionUtils::drawDetections(visFrame, boxes);
+
+        // 6.2 如果图片太大,再缩放（避免 MQTT 消息过大）
+        // ⚠️ 重要：缩放之后，event.objects 里的 bbox 也要按比例缩放，否则云端看到的 bbox 与图片不一致。
+        const int MAX_WIDTH = 1280;
+        const int MAX_HEIGHT = 960;
+        double scale = 1.0;
+        if (visFrame.cols > MAX_WIDTH || visFrame.rows > MAX_HEIGHT) {
+            scale = std::min(
+                static_cast<double>(MAX_WIDTH) / visFrame.cols,
+                static_cast<double>(MAX_HEIGHT) / visFrame.rows
+            );
+
+            int newWidth = static_cast<int>(visFrame.cols * scale);
+            int newHeight = static_cast<int>(visFrame.rows * scale);
+
+            cv::Mat resized;
+            cv::resize(visFrame, resized, cv::Size(newWidth, newHeight), 0, 0, cv::INTER_LINEAR);
+            visFrame = resized;
+
+            // 同步缩放 bbox（保证你说的“可视化图片”和检测结果完全一致）
+            for (auto& obj : event.objects) {
+                obj.bbox.x = static_cast<int>(std::lround(obj.bbox.x * scale));
+                obj.bbox.y = static_cast<int>(std::lround(obj.bbox.y * scale));
+                obj.bbox.w = static_cast<int>(std::lround(obj.bbox.w * scale));
+                obj.bbox.h = static_cast<int>(std::lround(obj.bbox.h * scale));
+            }
+
+            impl_->logger.debug("图片已缩放: " + std::to_string(frame.cols) + "x" + std::to_string(frame.rows) +
+                               " → " + std::to_string(newWidth) + "x" + std::to_string(newHeight) +
+                               ", scale=" + std::to_string(scale));
+        }
+        
+        // JPEG 编码 (使用较低的质量)
+        std::vector<uint8_t> jpegBuffer;
+        int quality = 60;  // 🔧 降低质量: 85 → 60
+        if (encodeImageToJPEG(visFrame, quality, jpegBuffer)) {
+            event.resultImage = encodeBase64(jpegBuffer);
+            impl_->logger.info("📦 resultImage 编码完成: JPEG=" + std::to_string(jpegBuffer.size()) + " bytes, " +
+                               "Base64=" + std::to_string(event.resultImage.size()) + " chars, quality=" + std::to_string(quality));
+        } else {
+            impl_->logger.warning("resultImage 编码失败");
+        }
+        
         impl_->logger.debug("事件构建完成: UUID=" + event.uuid);
         
     } catch (const std::exception& e) {
         impl_->logger.error("buildEvent 异常: " + std::string(e.what()));
+    }
+    
+    return event;
+}
+
+/**
+ * @brief 构建分割事件 (main_type=100001)
+ * 
+ * 与 buildEvent 类似,但使用 polygons 字段而非 points 字段。
+ * 
+ * 流程:
+ * 1. 生成 UUID
+ * 2. 填充基本信息
+ * 3. 转换 SAM2 mask → polygons
+ * 4. 计算 GPS 坐标 (使用轮廓中心点)
+ * 5. 时间戳格式化
+ * 
+ * @param frame 原始图像
+ * @param segResults SAM2 分割结果列表
+ * @param config 任务配置
+ * @param eventType 事件类型
+ * @param fileName 文件名 (可选)
+ * @return DetectionEvent 完整事件 (填充 polygons 字段)
+ */
+DetectionEvent TaskService::buildSegmentationEvent(const cv::Mat& frame,
+                                                   const std::vector<vision::SegmentationResult>& segResults,
+                                                   const TaskConfig& config,
+                                                   const EventType& eventType,
+                                                   const std::string& fileName) {
+    DetectionEvent event;
+    
+    try {
+        // 1. 基本信息
+        event.uuid = generateUUID();
+        event.taskID = std::stoi(config.taskId);  // string → int 转换
+        event.eventType = eventType.id;
+        event.main_type = eventType.mainType;  // 字段名改为 main_type (应该是 100001)
+        event.eventDescribe = eventType.eventDescribe;
+        event.fileName = fileName;
+        
+        // 2. 图像编码 (已废弃,跳过)
+        impl_->logger.debug("接口更新: 跳过图片编码步骤");
+        
+        // 3. 时间戳
+        event.createTime = getCurrentTimeString();
+        
+        // 4. 转换 SAM2结果 → polygons
+        std::vector<BoundingBox> tempBoxes;  // 用于 GPS 计算
+        
+        for (size_t i = 0; i < segResults.size(); ++i) {
+            const auto& result = segResults[i];
+            
+            Polygon polygon;
+            polygon.label = result.className;  // 类别名称
+            
+            // 如果有轮廓点,使用轮廓
+            if (!result.contours.empty()) {
+                // 简化轮廓 (减少顶点数)
+                std::vector<cv::Point> approx;
+                cv::approxPolyDP(result.contours, approx, 2.0, true);
+                
+                // 转换为 vertices
+                for (const auto& pt : approx) {
+                    Point2f vertex;
+                    vertex.x = static_cast<float>(pt.x);
+                    vertex.y = static_cast<float>(pt.y);
+                    polygon.vertices.push_back(vertex);
+                }
+                
+                impl_->logger.debug("分割对象 " + std::to_string(i) + " (" + result.className + "): " + 
+                                   std::to_string(polygon.vertices.size()) + " 个顶点");
+            } else if (!result.mask.empty()) {
+                // 从 mask 提取轮廓
+                std::vector<std::vector<cv::Point>> contours;
+                cv::findContours(result.mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+                
+                if (!contours.empty()) {
+                    // 取最大轮廓
+                    auto maxContour = std::max_element(contours.begin(), contours.end(),
+                        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) {
+                            return cv::contourArea(a) < cv::contourArea(b);
+                        });
+                    
+                    // 简化轮廓
+                    std::vector<cv::Point> approx;
+                    cv::approxPolyDP(*maxContour, approx, 2.0, true);
+                    
+                    // 转换为 vertices
+                    for (const auto& pt : approx) {
+                        Point2f vertex;
+                        vertex.x = static_cast<float>(pt.x);
+                        vertex.y = static_cast<float>(pt.y);
+                        polygon.vertices.push_back(vertex);
+                    }
+                    
+                    impl_->logger.debug("分割对象 " + std::to_string(i) + " (" + result.className + "): " + 
+                                       std::to_string(polygon.vertices.size()) + " 个顶点 (从mask提取)");
+                }
+            }
+            
+            event.polygons.push_back(polygon);
+            
+            // 同时保存边界框用于 GPS 计算
+            BoundingBox box;
+            box.x = result.box.x;
+            box.y = result.box.y;
+            box.w = result.box.width;
+            box.h = result.box.height;
+            box.classId = result.classId;
+            box.className = result.className;
+            box.confidence = result.confidence;
+            tempBoxes.push_back(box);
+        }
+        
+        // 5. GPS 坐标计算
+        // 使用边界框中心点计算 GPS
+        std::string imagePath = fileName.empty() ? "" : fileName;
+        
+        if (!calculateGPSCoordinates(frame, tempBoxes, event, imagePath)) {
+            // ✅ 按需求：经纬度计算失败时直接返回“空值”，不要降级估算。
+            impl_->logger.warning("GPS 计算失败：将经纬度置为空值(不做降级估算)");
+
+            const double kNull = std::numeric_limits<double>::quiet_NaN();
+            event.latitude = kNull;
+            event.longitude = kNull;
+            event.points.clear();
+            event.points.reserve(tempBoxes.size());
+            for (const auto& box : tempBoxes) {
+                BoundingBox eventBox = box;
+                eventBox.lat = kNull;
+                eventBox.lon = kNull;
+                event.points.push_back(eventBox);
+            }
+        }
+        
+        // 6. 填充 objects 数组 (新接口要求)
+        // 将 SAM2 分割结果转换为 DetectedObject (包含 mask 数据)
+        event.objects.clear();
+        event.objects.reserve(segResults.size());
+        
+        for (size_t i = 0; i < segResults.size(); ++i) {
+            const auto& result = segResults[i];
+            
+            DetectionEvent::DetectedObject obj;
+            obj.label = result.className;  // 类别名称
+            
+            // 填充 bbox
+            obj.bbox.x = static_cast<int>(result.box.x);
+            obj.bbox.y = static_cast<int>(result.box.y);
+            obj.bbox.w = static_cast<int>(result.box.width);
+            obj.bbox.h = static_cast<int>(result.box.height);
+            
+            // 填充 bbox 的 GPS location (如果已计算)
+            if (i < event.points.size()) {
+                obj.bbox.location.lon = event.points[i].lon;
+                obj.bbox.location.lat = event.points[i].lat;
+            } else {
+                // 降级方案：使用事件的平均 GPS
+                obj.bbox.location.lon = event.longitude;
+                obj.bbox.location.lat = event.latitude;
+            }
+            
+            // 填充 mask (从轮廓或 mask 提取)
+            obj.mask.clear();
+            
+            if (!result.contours.empty()) {
+                // 使用轮廓点 (激进简化以减小 JSON 大小)
+                std::vector<cv::Point> approx;
+                double epsilon = 5.0;  // 🔧 增大简化系数: 2.0 → 5.0 (减少点数)
+                cv::approxPolyDP(result.contours, approx, epsilon, true);
+                
+                // 🔧 进一步降采样: 如果点数仍然太多,按固定间隔采样
+                const int MAX_MASK_POINTS = 50;  // 最多保留 50 个点
+                int step = (approx.size() > MAX_MASK_POINTS) ? 
+                          (approx.size() / MAX_MASK_POINTS + 1) : 1;
+                
+                for (size_t j = 0; j < approx.size(); j += step) {
+                    const auto& pt = approx[j];
+                    DetectionEvent::MaskPoint maskPt;
+                    maskPt.x = pt.x;
+                    maskPt.y = pt.y;
+                    
+                    // TODO: 计算每个 mask 点的 GPS 坐标
+                    // 当前简化处理：使用 bbox 中心的 GPS
+                    maskPt.location.lon = obj.bbox.location.lon;
+                    maskPt.location.lat = obj.bbox.location.lat;
+                    
+                    obj.mask.push_back(maskPt);
+                }
+            } else if (!result.mask.empty()) {
+                // 从 mask 提取轮廓
+                std::vector<std::vector<cv::Point>> contours;
+                cv::findContours(result.mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+                
+                if (!contours.empty()) {
+                    // 取最大轮廓
+                    auto maxContour = std::max_element(contours.begin(), contours.end(),
+                        [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) {
+                            return cv::contourArea(a) < cv::contourArea(b);
+                        });
+                    
+                    // 激进简化轮廓
+                    std::vector<cv::Point> approx;
+                    double epsilon = 5.0;  // 🔧 增大简化系数
+                    cv::approxPolyDP(*maxContour, approx, epsilon, true);
+                    
+                    // 🔧 降采样
+                    const int MAX_MASK_POINTS = 50;
+                    int step = (approx.size() > MAX_MASK_POINTS) ? 
+                              (approx.size() / MAX_MASK_POINTS + 1) : 1;
+                    
+                    for (size_t j = 0; j < approx.size(); j += step) {
+                        const auto& pt = approx[j];
+                        DetectionEvent::MaskPoint maskPt;
+                        maskPt.x = pt.x;
+                        maskPt.y = pt.y;
+                        
+                        // TODO: 计算每个 mask 点的 GPS 坐标
+                        maskPt.location.lon = obj.bbox.location.lon;
+                        maskPt.location.lat = obj.bbox.location.lat;
+                        
+                        obj.mask.push_back(maskPt);
+                    }
+                }
+            }
+            
+            event.objects.push_back(obj);
+            
+            impl_->logger.info("📌 分割对象 " + std::to_string(i) + " (" + result.className + "): " +
+                               "mask=" + std::to_string(obj.mask.size()) + " 个点 (已优化)");
+        }
+        
+        impl_->logger.info("✅ 已填充 objects 数组: " + std::to_string(event.objects.size()) + " 个对象");
+        
+        // 7. 生成 resultImage (Base64 编码)
+        // 在原图上绘制分割轮廓,然后编码
+        cv::Mat visFrame = frame.clone();
+        
+        // 说明：不在这里提前缩放。
+        // 原因：分割可视化涉及 mask/contours 绘制，如果先缩放而不缩放 mask，会导致尺寸不匹配。
+        // 统一在“编码前”进行缩放，并同步缩放 event.objects 的 bbox。
+        
+        // 绘制每个分割对象
+        for (size_t i = 0; i < segResults.size(); ++i) {
+            const auto& result = segResults[i];
+            const auto& obj = event.objects[i];
+            
+            // 🎨 方法 1: 使用原始 mask 绘制半透明彩色遮罩
+            if (!result.mask.empty() && result.mask.rows == visFrame.rows && result.mask.cols == visFrame.cols) {
+                // 生成随机颜色 (每个对象不同颜色)
+                cv::Scalar color(rand() % 200 + 55, rand() % 200 + 55, rand() % 200 + 55);
+                
+                // ⚠️ 重要: result.mask 可能是 CV_32F,需要转换为 CV_8U
+                cv::Mat mask8u;
+                if (result.mask.type() != CV_8U) {
+                    result.mask.convertTo(mask8u, CV_8U, 255.0);  // [0,1] → [0,255]
+                } else {
+                    mask8u = result.mask;
+                }
+                
+                // 创建彩色遮罩
+                cv::Mat coloredMask = cv::Mat::zeros(visFrame.size(), visFrame.type());
+                coloredMask.setTo(color, mask8u);
+                
+                // 半透明叠加 (alpha = 0.5)
+                cv::addWeighted(visFrame, 1.0, coloredMask, 0.5, 0.0, visFrame);
+                
+                impl_->logger.debug("✅ 使用原始 mask 绘制半透明遮罩: " + result.className);
+                
+            } 
+            // 🎨 方法 2: 如果没有原始 mask,使用轮廓填充
+            else if (!result.contours.empty()) {
+                // 生成随机颜色
+                cv::Scalar color(rand() % 200 + 55, rand() % 200 + 55, rand() % 200 + 55);
+                
+                // 创建临时 mask
+                cv::Mat tempMask = cv::Mat::zeros(visFrame.size(), CV_8UC1);
+                std::vector<std::vector<cv::Point>> contours = {result.contours};
+                cv::drawContours(tempMask, contours, 0, cv::Scalar(255), cv::FILLED);
+                
+                // 创建彩色遮罩
+                cv::Mat coloredMask = cv::Mat::zeros(visFrame.size(), visFrame.type());
+                coloredMask.setTo(color, tempMask);
+                
+                // 半透明叠加
+                cv::addWeighted(visFrame, 1.0, coloredMask, 0.5, 0.0, visFrame);
+                
+                impl_->logger.debug("✅ 使用轮廓填充绘制半透明遮罩: " + result.className);
+            }
+            
+            // 绘制 bbox (绿色框)
+            cv::Rect rect(obj.bbox.x, obj.bbox.y, obj.bbox.w, obj.bbox.h);
+            cv::rectangle(visFrame, rect, cv::Scalar(0, 255, 0), 2);
+            
+            // 绘制标签
+            std::string label = obj.label;
+            cv::putText(visFrame, label, 
+                       cv::Point(obj.bbox.x, obj.bbox.y - 5),
+                       cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+        }
+        
+        // 🔧 如果图片太大,先缩放（避免 MQTT 消息过大）
+        // ⚠️ 同 buildEvent：缩放后同步缩放 objects 的 bbox，保证可视化图与 bbox 一致。
+        const int MAX_WIDTH = 1280;
+        const int MAX_HEIGHT = 960;
+        double scale = 1.0;
+        if (visFrame.cols > MAX_WIDTH || visFrame.rows > MAX_HEIGHT) {
+            scale = std::min(
+                static_cast<double>(MAX_WIDTH) / visFrame.cols,
+                static_cast<double>(MAX_HEIGHT) / visFrame.rows
+            );
+
+            int newWidth = static_cast<int>(visFrame.cols * scale);
+            int newHeight = static_cast<int>(visFrame.rows * scale);
+
+            cv::Mat resized;
+            cv::resize(visFrame, resized, cv::Size(newWidth, newHeight), 0, 0, cv::INTER_LINEAR);
+            visFrame = resized;
+
+            for (auto& obj : event.objects) {
+                obj.bbox.x = static_cast<int>(std::lround(obj.bbox.x * scale));
+                obj.bbox.y = static_cast<int>(std::lround(obj.bbox.y * scale));
+                obj.bbox.w = static_cast<int>(std::lround(obj.bbox.w * scale));
+                obj.bbox.h = static_cast<int>(std::lround(obj.bbox.h * scale));
+            }
+
+            impl_->logger.debug("分割可视化图片已缩放: " + std::to_string(frame.cols) + "x" + std::to_string(frame.rows) +
+                               " → " + std::to_string(newWidth) + "x" + std::to_string(newHeight) +
+                               ", scale=" + std::to_string(scale));
+        }
+
+        // JPEG 编码 (使用较低的质量以减小文件大小)
+        std::vector<uint8_t> jpegBuffer;
+        int quality = 60;  // 🔧 降低质量: 85 → 60 (减小文件大小)
+        if (encodeImageToJPEG(visFrame, quality, jpegBuffer)) {
+            event.resultImage = encodeBase64(jpegBuffer);
+            impl_->logger.info("📦 resultImage 编码完成: JPEG=" + std::to_string(jpegBuffer.size()) + " bytes, " +
+                               "Base64=" + std::to_string(event.resultImage.size()) + " chars, quality=" + std::to_string(quality));
+        } else {
+            impl_->logger.warning("resultImage 编码失败");
+        }
+        
+        impl_->logger.debug("分割事件构建完成: UUID=" + event.uuid + 
+                           ", polygons=" + std::to_string(event.polygons.size()));
+        
+    } catch (const std::exception& e) {
+        impl_->logger.error("buildSegmentationEvent 异常: " + std::string(e.what()));
     }
     
     return event;
@@ -986,15 +1798,37 @@ std::vector<BoundingBox> TaskService::filterByEventTypes(
             targetClassIds.insert(classId);
         }
     }
+
+    if (targetClassIds.empty()) {
+        // 典型原因：云端下发的是类别“名称”，但 labels_path 中找不到该名称，导致 TaskConfig::fromJson 映射为空。
+        // 这时继续过滤会把所有目标都过滤掉（因为关注集合为空），所以直接返回空并给出指引更清晰。
+        impl_->logger.warning("⚠️ [过滤] 关注类别集合为空：可能是 labels_path/coco.names 与云端下发的 class 名称不一致，"
+                             "或 labels_path 配置缺失/读取失败。将返回空集合(不保留任何目标)。");
+        return {};
+    }
+
+    // 读取labels(例如 coco.names)，用于日志展示名称，避免只看到数字ID难以排查
+    std::vector<std::string> classes;
+    try {
+        vision::VisionConfigLoader loader;
+        vision::DetectorConfig detCfg = loader.loadDetectorConfig("ppyoloe");
+        classes = detCfg.classes;
+    } catch (...) {
+        // ignore
+    }
     
-    impl_->logger.debug("🔍 [过滤] 关注的类别ID: [" + 
-                      [&targetClassIds]() {
-                          std::string ids;
+    impl_->logger.debug("🔍 [过滤] 关注类别: [" +
+                      [&targetClassIds, &classes]() {
+                          std::string text;
                           for (int id : targetClassIds) {
-                              if (!ids.empty()) ids += ", ";
-                              ids += std::to_string(id);
+                              if (!text.empty()) text += ", ";
+                              if (!classes.empty() && id >= 0 && id < static_cast<int>(classes.size())) {
+                                  text += classes[static_cast<size_t>(id)] + "(ID=" + std::to_string(id) + ")";
+                              } else {
+                                  text += "ID=" + std::to_string(id);
+                              }
                           }
-                          return ids;
+                          return text;
                       }() + "]");
     
     // 过滤
@@ -1018,52 +1852,110 @@ std::vector<BoundingBox> TaskService::filterByEventTypes(
 }
 
 /**
- * @brief DetectionEvent 转 JSON
+ * @brief DetectionEvent 转 JSON (新接口格式 v2.0)
  * 
- * 使用 nlohmann/json 库序列化。
+ * 生成嵌套的 JSON 结构:
+ * {
+ *   "UUID": "...",
+ *   "taskID": 123,
+ *   "main_type": 100000,
+ *   "result": {
+ *     "image": "Base64图片数据",
+ *     "objects": [
+ *       {
+ *         "label": "car",
+ *         "bbox": {"x": 100, "y": 200, "w": 50, "h": 60, "location": {"lon": 121.5, "lat": 31.2}},
+ *         "mask": [{"x": 105, "y": 205, "location": {"lon": 121.5, "lat": 31.2}}, ...]
+ *       }
+ *     ]
+ *   }
+ * }
  * 
  * 面试要点:
- * - JSON vs XML vs Protocol Buffers
- * - JSON 优势: 可读性好、广泛支持、轻量级
- * - JSON 缺点: 没有 schema 验证、不支持二进制、解析开销大
+ * - JSON 嵌套结构设计: result 作为顶层容器,包含 image 和 objects
+ * - 数组序列化: objects 和 mask 都是数组,需要正确处理
+ * - GPS 坐标精度: 经度 longitude 在前,纬度 latitude 在后 (GeoJSON 标准)
  */
 std::string TaskService::eventToJson(const DetectionEvent& event) {
     nlohmann::json j;
     
-    // 基本信息
+    // 1. 顶层基本信息
     j["UUID"] = event.uuid;
-    j["taskID"] = event.taskId;
+    j["taskID"] = event.taskID;  // int 类型
     j["eventType"] = event.eventType;
-    j["main_type"] = event.mainType;
+    j["main_type"] = event.main_type;  // int 类型
     j["eventDescribe"] = event.eventDescribe;
-    
-    // 图片
-    j["picture"] = event.pictureBase64;
-    j["pictureCode"] = event.pictureCode;
-    
-    // GPS
-    j["latitude"] = event.latitude;
-    j["longitude"] = event.longitude;
-    
-    // 时间
+    j["fileName"] = event.fileName;
     j["createTime"] = event.createTime;
     
-    // 检测框列表
-    nlohmann::json points = nlohmann::json::array();
-    for (const auto& box : event.points) {
-        nlohmann::json point;
-        point["x"] = box.x;
-        point["y"] = box.y;
-        point["w"] = box.w;
-        point["h"] = box.h;
-        point["lon"] = box.lon;
-        point["lat"] = box.lat;
-        point["classId"] = box.classId;
-        point["className"] = box.className;
-        point["confidence"] = box.confidence;
-        points.push_back(point);
+    // 保留旧字段 latitude/longitude 用于兼容 (事件平均 GPS)
+    // ✅ 约定：若 GPS 计算失败，event.latitude/event.longitude 会是 NaN，这里序列化为 JSON null。
+    auto toJsonNumberOrNull = [](double v) -> nlohmann::json {
+        if (std::isnan(v)) return nullptr;
+        return v;
+    };
+    j["latitude"] = toJsonNumberOrNull(event.latitude);
+    j["longitude"] = toJsonNumberOrNull(event.longitude);
+    
+    // 2. 嵌套的 result 对象
+    nlohmann::json result;
+    
+    // 2.1 result.image (Base64 编码的可视化图片)
+    result["image"] = event.resultImage;
+    
+    // 2.2 result.objects (检测/分割对象数组)
+    nlohmann::json objects = nlohmann::json::array();
+    
+    for (const auto& obj : event.objects) {
+        nlohmann::json objJson;
+        
+        // 对象标签
+        objJson["label"] = obj.label;
+        
+        // bbox 对象 (包含 location)
+        nlohmann::json bbox;
+        bbox["x"] = obj.bbox.x;
+        bbox["y"] = obj.bbox.y;
+        bbox["w"] = obj.bbox.w;
+        bbox["h"] = obj.bbox.h;
+        
+    // bbox.location
+    nlohmann::json bboxLocation;
+    bboxLocation["lon"] = toJsonNumberOrNull(obj.bbox.location.lon);  // 经度在前
+    bboxLocation["lat"] = toJsonNumberOrNull(obj.bbox.location.lat);  // 纬度在后
+        bbox["location"] = bboxLocation;
+        
+        objJson["bbox"] = bbox;
+        
+        // mask 数组 (分割轮廓点)
+        nlohmann::json mask = nlohmann::json::array();
+        
+        for (const auto& pt : obj.mask) {
+            nlohmann::json maskPt;
+            maskPt["x"] = pt.x;
+            maskPt["y"] = pt.y;
+            
+            // maskPt.location
+            nlohmann::json ptLocation;
+            ptLocation["lon"] = toJsonNumberOrNull(pt.location.lon);
+            ptLocation["lat"] = toJsonNumberOrNull(pt.location.lat);
+            maskPt["location"] = ptLocation;
+            
+            mask.push_back(maskPt);
+        }
+        
+        objJson["mask"] = mask;
+        
+        objects.push_back(objJson);
     }
-    j["points"] = points;
+    
+    result["objects"] = objects;
+    
+    // 3. 将 result 添加到顶层 JSON
+    j["result"] = result;
+    
+    // 4. 保留旧字段用于调试和兼容 (可选,后续可删除)
+    // points 和 polygons 已被 result.objects 替代
     
     return j.dump();  // 转为字符串
 }

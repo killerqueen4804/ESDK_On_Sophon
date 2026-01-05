@@ -54,14 +54,17 @@ DetectorConfig VisionConfigLoader::loadDetectorConfig(const std::string& detecto
     // ------------------------------------------------
     // 3. 加载类别标签
     // ------------------------------------------------
+    // ⚠️ 重要：不要在代码里“写死 COCO 80 类”。
+    // 因为不同模型/数据集的类别集合不一样，必须以配置中的 labels_path 为准。
     std::string labelsPath = config_.getString(prefix + "labels_path", "");
-    if (!labelsPath.empty()) {
+    if (labelsPath.empty()) {
+        // 这里不再默认回退到 COCO，直接报错提示配置缺失。
+        logger_.error("未配置类别标签文件 labels_path: " + prefix + "labels_path");
+        logger_.error("请在 config.json 中为该模型配置正确的 labels_path，避免类别不一致");
+        config.classes.clear();
+    } else {
         config.classes = loadClassLabels(labelsPath);
         logger_.info("  类别数量: " + std::to_string(config.classes.size()));
-    } else {
-        // 如果没有配置标签文件,使用默认COCO标签
-        logger_.warning("未配置类别标签文件,使用默认COCO 80类");
-        config.classes = getDefaultCocoLabels();
     }
     
     // ------------------------------------------------
@@ -174,9 +177,9 @@ std::vector<std::string> VisionConfigLoader::loadClassLabels(const std::string& 
     std::ifstream file(labelsPath);
     
     if (!file.is_open()) {
-        logger_.warning("无法打开标签文件: " + labelsPath);
-        logger_.warning("将使用默认COCO标签");
-        return getDefaultCocoLabels();
+        logger_.error("无法打开标签文件: " + labelsPath);
+        logger_.error("类别标签文件是必须项（不同模型类别可能不一致），请检查 labels_path 是否正确");
+        return {};
     }
     
     // 逐行读取标签
@@ -197,8 +200,9 @@ std::vector<std::string> VisionConfigLoader::loadClassLabels(const std::string& 
     file.close();
     
     if (labels.empty()) {
-        logger_.warning("标签文件为空,使用默认COCO标签");
-        return getDefaultCocoLabels();
+        logger_.error("标签文件为空: " + labelsPath);
+        logger_.error("类别标签文件为空会导致 classId->className 映射错误，请修复 labels 文件内容");
+        return {};
     }
     
     logger_.info("成功加载 " + std::to_string(labels.size()) + " 个类别标签");
@@ -207,27 +211,8 @@ std::vector<std::string> VisionConfigLoader::loadClassLabels(const std::string& 
 
 // ==================== 默认COCO标签 ====================
 
-std::vector<std::string> VisionConfigLoader::getDefaultCocoLabels() const {
-    // COCO数据集的80个类别
-    return {
-        "person", "bicycle", "car", "motorcycle", "airplane",
-        "bus", "train", "truck", "boat", "traffic light",
-        "fire hydrant", "stop sign", "parking meter", "bench", "bird",
-        "cat", "dog", "horse", "sheep", "cow",
-        "elephant", "bear", "zebra", "giraffe", "backpack",
-        "umbrella", "handbag", "tie", "suitcase", "frisbee",
-        "skis", "snowboard", "sports ball", "kite", "baseball bat",
-        "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
-        "wine glass", "cup", "fork", "knife", "spoon",
-        "bowl", "banana", "apple", "sandwich", "orange",
-        "broccoli", "carrot", "hot dog", "pizza", "donut",
-        "cake", "chair", "couch", "potted plant", "bed",
-        "dining table", "toilet", "tv", "laptop", "mouse",
-        "remote", "keyboard", "cell phone", "microwave", "oven",
-        "toaster", "sink", "refrigerator", "book", "clock",
-        "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
-    };
-}
+// 说明：不再提供默认 COCO 标签的兜底逻辑。
+// 原因：不同模型/数据集类别顺序可能不同，继续兜底会“静默错配”，比直接失败更难排查。
 
 }  // namespace vision
 }  // namespace esdk_sophon

@@ -8,6 +8,7 @@
 
 #include "esdk_sophon/task/TaskTypes.h"
 #include "esdk_sophon/core/Config.h"  // 添加 Config 头文件
+#include "esdk_sophon/vision/VisionConfigLoader.h"
 #include <stdexcept>
 
 namespace esdk_sophon {
@@ -20,6 +21,27 @@ namespace task {
  */
 TaskConfig TaskConfig::fromJson(const nlohmann::json& json) {
     TaskConfig config;
+
+    // ================================================================
+    // ⭐ 重要设计：动态类别映射（避免写死 COCO）
+    //
+    // 云端下发的 type[].class 通常是“类别名称”，我们需要把它映射为 classId。
+    // 但不同模型/不同数据集的 labels 文件可能完全不同（类别集合/顺序都可能变化）。
+    // 因此：必须从当前模型对应的 labels_path 读取类别列表，并按“名称->索引”映射。
+    // ================================================================
+    std::unordered_map<std::string, int> classNameToId;
+    try {
+        vision::VisionConfigLoader loader;
+        // 目前任务默认使用 PPYOLOE 检测器（TaskService 同样如此），因此这里保持一致。
+        // 如果未来支持动态 detectorType，可把 detectorType 放到 TaskConfig 或全局配置里。
+        vision::DetectorConfig detCfg = loader.loadDetectorConfig("ppyoloe");
+        for (size_t i = 0; i < detCfg.classes.size(); ++i) {
+            classNameToId[detCfg.classes[i]] = static_cast<int>(i);
+        }
+    } catch (...) {
+        // 这里不抛异常：允许任务配置继续构建，但 class 映射会失败并导致 classIds 为空。
+        // 运行时过滤会打印“关注类别ID: 无”，提醒你排查 labels 配置。
+    }
     
     // ===== 基本信息 =====
     config.taskId = std::to_string(json.at("taskID").get<int>());
@@ -59,30 +81,6 @@ TaskConfig TaskConfig::fromJson(const nlohmann::json& json) {
     // 转换事件类型 (从 types 数组中提取)
     // JSON 格式: {"id": 200004, "name": "垃圾倾倒", "class": ["car", "person"], "main_type": 100000}
     if (json.contains("type") && json["type"].is_array()) {
-        // ⭐ COCO 类别名称到 ID 的映射表 (80 个类别)
-        static const std::map<std::string, int> cocoClassMap = {
-            {"person", 0}, {"bicycle", 1}, {"car", 2}, {"motorcycle", 3},
-            {"airplane", 4}, {"bus", 5}, {"train", 6}, {"truck", 7},
-            {"boat", 8}, {"traffic light", 9}, {"fire hydrant", 10}, {"stop sign", 11},
-            {"parking meter", 12}, {"bench", 13}, {"bird", 14}, {"cat", 15},
-            {"dog", 16}, {"horse", 17}, {"sheep", 18}, {"cow", 19},
-            {"elephant", 20}, {"bear", 21}, {"zebra", 22}, {"giraffe", 23},
-            {"backpack", 24}, {"umbrella", 25}, {"handbag", 26}, {"tie", 27},
-            {"suitcase", 28}, {"frisbee", 29}, {"skis", 30}, {"snowboard", 31},
-            {"sports ball", 32}, {"kite", 33}, {"baseball bat", 34}, {"baseball glove", 35},
-            {"skateboard", 36}, {"surfboard", 37}, {"tennis racket", 38}, {"bottle", 39},
-            {"wine glass", 40}, {"cup", 41}, {"fork", 42}, {"knife", 43},
-            {"spoon", 44}, {"bowl", 45}, {"banana", 46}, {"apple", 47},
-            {"sandwich", 48}, {"orange", 49}, {"broccoli", 50}, {"carrot", 51},
-            {"hot dog", 52}, {"pizza", 53}, {"donut", 54}, {"cake", 55},
-            {"chair", 56}, {"couch", 57}, {"potted plant", 58}, {"bed", 59},
-            {"dining table", 60}, {"toilet", 61}, {"tv", 62}, {"laptop", 63},
-            {"mouse", 64}, {"remote", 65}, {"keyboard", 66}, {"cell phone", 67},
-            {"microwave", 68}, {"oven", 69}, {"toaster", 70}, {"sink", 71},
-            {"refrigerator", 72}, {"book", 73}, {"clock", 74}, {"vase", 75},
-            {"scissors", 76}, {"teddy bear", 77}, {"hair drier", 78}, {"toothbrush", 79}
-        };
-        
         for (const auto& typeObj : json["type"]) {
             EventType eventType;
             eventType.id = typeObj.value("id", 0);
@@ -95,15 +93,10 @@ TaskConfig TaskConfig::fromJson(const nlohmann::json& json) {
                     if (className.is_string()) {
                         std::string name = className.get<std::string>();
                         
-                        // 查找类别名称对应的 ID
-                        auto it = cocoClassMap.find(name);
-                        if (it != cocoClassMap.end()) {
+                        // 查找类别名称对应的 ID（基于 labels_path 的动态映射）
+                        auto it = classNameToId.find(name);
+                        if (it != classNameToId.end()) {
                             eventType.classIds.push_back(it->second);
-                            // 📌 日志：显示映射结果
-                            // logger.debug("类别映射: " + name + " -> " + std::to_string(it->second));
-                        } else {
-                            // 未找到映射，记录警告
-                            // logger.warning("未知的类别名称: " + name);
                         }
                     }
                 }

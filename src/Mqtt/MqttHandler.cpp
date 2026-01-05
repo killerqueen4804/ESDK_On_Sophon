@@ -151,14 +151,17 @@ bool MqttHandler::start() {
     logger_.info("订阅成功: " + servicesTopicSub_);
     
     // 3. 订阅飞行器 OSD topic（如果配置了飞行器序列号）
+    // 说明：LiveStreamTask 的“帧时刻 GPS 快照”依赖该 topic 的持续更新。
     if (!aircraftOsdTopicSub_.empty()) {
         if (mqttClient_.subscribe(aircraftOsdTopicSub_, 0)) {  // QoS 0 即可
             osdSubscribed_ = true;
-            logger_.info("订阅飞行器OSD成功: " + aircraftOsdTopicSub_);
+            logger_.info("✅ 订阅飞行器OSD成功: " + aircraftOsdTopicSub_);
         } else {
-            logger_.warning("订阅飞行器OSD失败: " + aircraftOsdTopicSub_ + " (非关键性错误，继续运行)");
+            logger_.warning("⚠️ 订阅飞行器OSD失败: " + aircraftOsdTopicSub_ + " (非关键性错误，继续运行)");
             osdSubscribed_ = false;
         }
+    } else {
+        logger_.warning("⚠️ aircraftOsdTopicSub_ 为空，无法订阅 OSD；请在 config.json 配置 device.aircraft.sn");
     }
     
     // 4. 订阅机场 Events topic（如果配置了机场网关序列号）
@@ -166,10 +169,10 @@ bool MqttHandler::start() {
     if (!gatewayEventsTopicSub_.empty()) {
         if (mqttClient_.subscribe(gatewayEventsTopicSub_, 0)) {  // QoS 0 即可
             gatewayEventsSubscribed_ = true;
-            logger_.info("📋 订阅机场Events成功: " + gatewayEventsTopicSub_);
+            logger_.info("✅ 📋 订阅机场Events成功: " + gatewayEventsTopicSub_);
             logger_.info("   💡 将监听航线任务进度 (flighttask_progress)，只有到达航点后才启用智能变焦拍照");
         } else {
-            logger_.warning("订阅机场Events失败: " + gatewayEventsTopicSub_ + " (非关键性错误，继续运行)");
+            logger_.warning("⚠️ 订阅机场Events失败: " + gatewayEventsTopicSub_ + " (非关键性错误，继续运行)");
             gatewayEventsSubscribed_ = false;
         }
     }

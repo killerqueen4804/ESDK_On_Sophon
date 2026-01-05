@@ -143,7 +143,7 @@ struct TaskConfig {
         , source(DataSource::LIVESTREAM)
         , mediaPath("")
         , detectionEnabled(true)
-        , reportIntervalSec(10)
+        , reportIntervalSec(15)
         , enableVisualization(true)
         , maxDetectionsPerFrame(100)
         , enableRTMP(false)
@@ -271,59 +271,138 @@ struct BoundingBox {
 };
 
 /**
+ * @brief 多边形顶点
+ */
+struct Point2f {
+    float x;
+    float y;
+};
+
+/**
+ * @brief 分割多边形
+ */
+struct Polygon {
+    std::string label;
+    std::vector<Point2f> vertices;
+};
+
+/**
  * @brief 检测事件数据
  * 
  * 完整的事件数据结构，用于上报到平台。
  * 对应 MQTT topic: drone/{device_sn}/info/event
  * 
- * JSON格式示例:
+ * **新接口格式** (2025-12-12更新):
  * @code
  * {
- *   "UUID": "550e8400-e29b-41d4-a716-446655440000",
- *   "taskID": 12345,
- *   "eventType": 1,
- *   "main_type": 1,
- *   "eventDescribe": "检测到目标",
- *   "picture": "/9j/4AAQSkZJRg...",  // Base64
- *   "pictureCode": ".jpg",
- *   "latitude": 31.230391,
- *   "longitude": 121.473701,
- *   "createTime": "2025-11-02T10:30:00.000Z",
- *   "points": [{"x":100, "y":200, "w":50, "h":80, "lon":121.47, "lat":31.23}]
+ *   "UUID": "...",
+ *   "taskID": 1234,
+ *   "eventType": 200009,
+ *   "main_type": 100001,
+ *   "createTime": "2025-12-12T10:30:00Z",
+ *   "eventDescribe": "分割测试",
+ *   "longitude": 121.47,
+ *   "latitude": 31.23,
+ *   "fileName": "test.jpg",
+ *   "result": {
+ *     "image": "base64_encoded_image_data",
+ *     "objects": [
+ *       {
+ *         "label": "cat",
+ *         "bbox": {
+ *           "x": 54, "y": 182, "w": 152, "h": 195,
+ *           "location": {"lon": 121.47, "lat": 31.23}
+ *         },
+ *         "mask": [
+ *           {"x": 54, "y": 182, "location": {"lon": 121.47, "lat": 31.23}},
+ *           {"x": 60, "y": 185, "location": {"lon": 121.47, "lat": 31.24}}
+ *         ]
+ *       }
+ *     ]
+ *   }
  * }
  * @endcode
  */
 struct DetectionEvent {
-    // ===== 基本信息 =====
-    std::string uuid;                ///< 事件唯一ID (UUID v4)
-    std::string taskId;              ///< 任务ID
-    int eventType;                   ///< 事件类型ID
-    int mainType;                    ///< 主类型ID
-    std::string eventDescribe;       ///< 事件描述
+    /**
+     * @brief GPS 位置信息
+     */
+    struct GpsLocation {
+        double lon;  ///< 经度
+        double lat;  ///< 纬度
+        
+        GpsLocation() : lon(0.0), lat(0.0) {}
+        GpsLocation(double longitude, double latitude) : lon(longitude), lat(latitude) {}
+    };
+
+    /**
+     * @brief 掩码轮廓点 (分割结果)
+     */
+    struct MaskPoint {
+        int x;                 ///< 像素 x 坐标
+        int y;                 ///< 像素 y 坐标
+        GpsLocation location;  ///< 对应的 GPS 坐标
+        
+        MaskPoint() : x(0), y(0) {}
+        MaskPoint(int px, int py, GpsLocation loc = GpsLocation()) 
+            : x(px), y(py), location(loc) {}
+    };
+
+    /**
+     * @brief 检测框信息
+     */
+    struct BBox {
+        int x;                 ///< 左上角 x 坐标
+        int y;                 ///< 左上角 y 坐标
+        int w;                 ///< 宽度
+        int h;                 ///< 高度
+        GpsLocation location;  ///< 中心点 GPS 坐标
+        
+        BBox() : x(0), y(0), w(0), h(0) {}
+    };
+
+    /**
+     * @brief 单个检测对象
+     */
+    struct DetectedObject {
+        std::string label;             ///< 类别标签 (如 "cat", "person")
+        BBox bbox;                     ///< 检测框
+        std::vector<MaskPoint> mask;   ///< 分割轮廓点列表 (可选,分割任务才有)
+        
+        DetectedObject() : label("") {}
+        DetectedObject(const std::string& lbl) : label(lbl) {}
+    };
+
+    // ========== 顶层字段 ==========
+    std::string uuid;                  ///< 事件唯一ID (UUID v4)
+    int taskID;                        ///< 任务ID (整数)
+    int eventType;                     ///< 事件类型ID
+    int main_type;                     ///< 主类型ID (100000=检测, 100001=分割)
+    std::string createTime;            ///< 创建时间 (ISO 8601格式)
+    std::string eventDescribe;         ///< 事件描述
+    double longitude;                  ///< 经度 (无人机位置)
+    double latitude;                   ///< 纬度 (无人机位置)
+    std::string fileName;              ///< 文件名称
+
+    // ========== result 字段 ==========
+    std::string resultImage;           ///< 结果图片 Base64 编码
+    std::vector<DetectedObject> objects;  ///< 检测对象列表
     
-    // ===== 图像数据 =====
-    std::string pictureBase64;       ///< 图片数据 (Base64编码)
-    std::string pictureCode;         ///< 图片格式 (例如 ".jpg")
-    
-    // ===== 位置信息 =====
-    double latitude;                 ///< 纬度 (WGS84)
-    double longitude;                ///< 经度 (WGS84)
-    std::string createTime;          ///< 创建时间 (ISO 8601格式)
-    
-    // ===== 检测结果 =====
-    std::vector<BoundingBox> points; ///< 检测框列表
+    // ========== 内部临时字段 (不序列化到 JSON,仅用于 GPS 计算) ==========
+    std::vector<BoundingBox> points;   ///< 临时字段: 检测框列表 (用于 GPS 计算)
+    std::vector<Polygon> polygons;     ///< 临时字段: 多边形列表 (用于分割 GPS 计算)
     
     DetectionEvent()
         : uuid("")
-        , taskId("")
+        , taskID(0)
         , eventType(0)
-        , mainType(0)
-        , eventDescribe("")
-        , pictureBase64("")
-        , pictureCode(".jpg")
-        , latitude(0.0)
-        , longitude(0.0)
+        , main_type(0)
         , createTime("")
+        , eventDescribe("")
+        , longitude(0.0)
+        , latitude(0.0)
+        , fileName("")
+        , resultImage("")
     {}
 };
 

@@ -39,6 +39,8 @@
 #include "esdk_sophon/core/Logger.h"
 // #include "esdk_sophon/vision/Vision.h"  // TODO: Vision类已废弃，使用DetectorFactory
 #include "esdk_sophon/Mqtt/MqttClient.h"
+#include "esdk_sophon/vision/segmentation/ISegmentor.h"  // SAM2 分割结果
+#include "esdk_sophon/device/FlightDataProvider.h"  // GpsPosition (直播帧时刻GPS快照)
 
 #include <memory>
 #include <string>
@@ -177,10 +179,66 @@ public:
      * service.processFrame(frame, config, boxes);  // fileName 默认为 ""
      * @endcode
      */
+    /**
+     * @brief 处理单帧图像（可选带帧时刻 GPS 快照）
+     *
+     * @param gpsSnapshot 可选参数：取帧时刻的经纬度快照（直播流建议传入，媒体文件可传 nullptr）
+     *
+     * @note 为了满足“上报经纬度必须对应取帧时刻”的需求，
+     *       LiveStreamTask 会在取到 decode 帧时读取 FlightDataProvider 的 GPS，
+     *       并通过该参数传入；TaskService 在触发上报时将其写入事件顶层 longitude/latitude。
+     */
     bool processFrame(const cv::Mat& frame, 
                      const TaskConfig& config,
                      std::vector<BoundingBox>& outBoxes,
-                     const std::string& fileName = "");
+                     const std::string& fileName = "",
+                     const device::GpsPosition* gpsSnapshot = nullptr);
+    
+    /**
+     * @brief 处理检测任务 (main_type=100000)
+     * 
+     * 检测流程:
+     * 1. 调用检测器获取目标框
+     * 2. 过滤目标类别
+     * 3. 检查上报间隔 (限流)
+     * 4. 构建事件 (填充 points 字段)
+     * 5. 发布 MQTT 事件
+     * 
+     * @param frame 输入图像帧
+     * @param config 任务配置
+     * @param[out] outBoxes 输出检测框列表
+     * @param fileName 文件名 (可选)
+     * @return true 处理成功, false 处理失败
+     */
+    bool processDetection(const cv::Mat& frame, 
+                         const TaskConfig& config,
+                         std::vector<BoundingBox>& outBoxes,
+                         const std::string& fileName,
+                         const device::GpsPosition* gpsSnapshot);
+    
+    /**
+     * @brief 处理分割任务 (main_type=100001)
+     * 
+     * 分割流程:
+     * 1. 调用检测器获取候选框
+     * 2. 调用 SAM2 分割器进行精细分割
+     * 3. 检查上报间隔 (限流)
+     * 4. 构建事件 (填充 polygons 字段)
+     * 5. 发布 MQTT 事件
+     * 
+     * @param frame 输入图像帧
+     * @param config 任务配置
+     * @param[out] outBoxes 输出检测框列表 (用于可视化)
+     * @param fileName 文件名 (可选)
+     * @return true 处理成功, false 处理失败
+     * 
+     * @note 如果 SAM2 未启用,会返回 false
+     */
+    bool processSegmentation(const cv::Mat& frame, 
+                            const TaskConfig& config,
+                            std::vector<BoundingBox>& outBoxes,
+                            const std::string& fileName,
+                            const device::GpsPosition* gpsSnapshot);
     
     /**
      * @brief 目标检测 - 调用 Vision 模块
@@ -224,6 +282,31 @@ public:
                               const TaskConfig& config,
                               const EventType& eventType,
                               const std::string& fileName = "");
+    
+    /**
+     * @brief 构建分割事件 (main_type=100001)
+     * 
+     * 与 buildEvent 类似,但使用 polygons 字段而非 points 字段。
+     * 
+     * 流程:
+     * 1. 生成 UUID
+     * 2. 填充基本信息
+     * 3. 转换 SAM2 mask → polygons (轮廓提取 + 简化)
+     * 4. 计算 GPS 坐标 (使用轮廓中心点)
+     * 5. 时间戳格式化
+     * 
+     * @param frame 原始图像
+     * @param segResults SAM2 分割结果列表
+     * @param config 任务配置
+     * @param eventType 事件类型
+     * @param fileName 文件名 (可选)
+     * @return DetectionEvent 完整事件 (填充 polygons 字段)
+     */
+    DetectionEvent buildSegmentationEvent(const cv::Mat& frame,
+                                          const std::vector<vision::SegmentationResult>& segResults,
+                                          const TaskConfig& config,
+                                          const EventType& eventType,
+                                          const std::string& fileName = "");
     
     /**
      * @brief 发布事件到 MQTT - 上报平台

@@ -77,10 +77,7 @@ bool Application::initialize() {
     std::cout << "========================================\n\n";
     
     try {
-        // ------------------------------------------------
-        // 步骤0: 初始化DJI Edge-SDK（最优先！）
-        // ------------------------------------------------
-        std::cout << "[0/5] 初始化 DJI Edge-SDK...\n";
+
         
         using namespace edge_sdk;
         auto rc = ESDKInit();
@@ -93,12 +90,7 @@ bool Application::initialize() {
             return false;
         }
         
-        std::cout << "✅ Edge-SDK 初始化成功\n\n";
-        
-        // ------------------------------------------------
-        // 步骤1: 初始化Logger（最先初始化，其他模块需要日志）
-        // ------------------------------------------------
-        std::cout << "[1/5] 初始化日志系统...\n";
+
         // Logger是单例，已在构造函数中获取引用
         // 这里只是验证Logger可用
         logger_.info("========================================");
@@ -106,10 +98,7 @@ bool Application::initialize() {
         logger_.info("========================================");
         std::cout << "✅ 日志系统初始化成功\n\n";
         
-        // ------------------------------------------------
-        // 步骤2: 加载配置文件
-        // ------------------------------------------------
-        std::cout << "[2/5] 加载配置文件...\n";
+
         
         // 尝试从多个位置加载配置
         std::vector<std::string> configPaths = {
@@ -133,24 +122,7 @@ bool Application::initialize() {
             std::cout << "⚠️  未找到配置文件，使用默认配置\n\n";
         }
         
-        // ------------------------------------------------
-        // 步骤3: 初始化TaskManager
-        // ------------------------------------------------
-        std::cout << "[3/5] 初始化任务管理器...\n";
-        
-        // ⚠️ 注意：TaskManager 必须在 MqttClient 之后初始化
-        //         因为 TaskManager 需要 MqttClient 的引用
-        // 
-        // 但由于 MqttClient 还未初始化，这里先跳过
-        // 在 MqttClient 初始化后再初始化 TaskManager
-        
-        logger_.info("TaskManager等待后续初始化（需要MQTT客户端）");
-        std::cout << "⏳ TaskManager等待MQTT连接后初始化\n\n";
-        
-        // ------------------------------------------------
-        // 步骤4: 初始化并连接MqttClient
-        // ------------------------------------------------
-        std::cout << "[4/5] 连接MQTT服务器...\n";
+
         
         // MqttClient从Config中读取配置，无需传参
         // 配置项包括：mqtt.broker, mqtt.port, mqtt.client_id等
@@ -173,10 +145,6 @@ bool Application::initialize() {
         logger_.info("MQTT连接成功");
         std::cout << "✅ MQTT连接成功\n\n";
         
-        // ------------------------------------------------
-        // 步骤4.5: 初始化TaskManager
-        // ------------------------------------------------
-        std::cout << "[4.5/5] 初始化任务管理器...\n";
         
         // TaskManager 会自动从单例获取 MQTT 客户端
         if (!taskManager_.initialize()) {
@@ -186,12 +154,7 @@ bool Application::initialize() {
         }
         
         logger_.info("TaskManager初始化成功");
-        std::cout << "✅ 任务管理器初始化成功\n\n";
         
-        // ------------------------------------------------
-        // 步骤5: 初始化并启动MqttHandler
-        // ------------------------------------------------
-        std::cout << "[5/5] 启动MQTT消息处理器...\n";
         
         // 初始化（读取配置、构建Topic）
         if (!mqttHandler_.initialize()) {
@@ -208,7 +171,6 @@ bool Application::initialize() {
         }
         
         logger_.info("MqttHandler启动成功");
-        std::cout << "✅ MQTT消息处理器启动成功\n\n";
         
         // ------------------------------------------------
         // 注册信号处理函数

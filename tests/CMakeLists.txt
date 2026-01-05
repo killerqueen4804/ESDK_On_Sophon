@@ -1230,3 +1230,62 @@ message(STATUS "配置测试程序: test_tracker")
 # - 单元测试 AAA 模式：Arrange-Act-Assert
 # ============================================================================
 
+# ----------------------------------------------------------------------------
+
+# SAM2 分割器测试程序
+add_executable(test_sam2 test_sam2.cpp)
+
+# 链接所需库
+target_link_libraries(test_sam2
+    PRIVATE
+        segmentation            # SAM2 分割器模块
+        detector                # YOLO 检测器 (用于生成提示框)
+        vision_common           # VisionConfigLoader
+        core                    # Logger
+        ThirdParty::OpenCV      # OpenCV
+        ThirdParty::bmrt        # BMRuntime
+        ThirdParty::bmcv        # BMCV
+        pthread
+)
+
+# 交叉编译链接器配置
+target_link_options(test_sam2 PRIVATE
+    -Wl,-rpath-link,${CMAKE_SOURCE_DIR}/third_party/soc-sdk/lib
+    -Wl,-rpath-link,${CMAKE_SOURCE_DIR}/third_party/opencv4.2/lib
+    -Wl,--allow-shlib-undefined
+)
+
+# 设置输出目录
+set_target_properties(test_sam2 PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/bin/tests"
+)
+
+# 添加编译信息
+message(STATUS "配置测试程序: test_sam2")
+
+# ============================================================================
+# 📚 知识点：SAM2 分割器测试
+# ============================================================================
+#
+# test_sam2 测试内容：
+# 1. SAM2 模型加载 (Encoder + Decoder)
+# 2. 与 YOLO 检测器集成
+# 3. 基于检测框的分割 (Prompt-based Segmentation)
+# 4. 掩码后处理 (轮廓提取)
+# 5. 结果可视化
+#
+# 运行方式：
+# ./bin/tests/test_sam2 \
+#   /data/Edge-SDK/sophon-demo/sample/SAM2/image_encoder/sam2_encoder_f16_1b.bmodel \
+#   /data/Edge-SDK/sophon-demo/sample/SAM2/image_decoder/sam2_decoder_f16_1b.bmodel \
+#   /path/to/test_image.jpg
+#
+# 面试要点：
+# - SAM2 架构：Encoder-Decoder 分离设计
+# - Prompt Engineering：点、框、掩码三种提示方式
+# - BMRuntime API：内存管理、推理流程
+# - 掩码后处理：Resize + 二值化 + 轮廓提取
+# - RAII 原则：bm_tensor_t 资源管理
+# ============================================================================
+
+

@@ -28,6 +28,7 @@
 #include <random>      // 用于UUID生成
 #include <sstream>     // 用于字符串流
 #include <iomanip>     // 用于格式化输出
+#include <queue>
 
 namespace esdk_sophon {
 namespace mqtt {
@@ -242,6 +243,23 @@ private:
     void reconnectThreadFunc();  ///< 重连线程函数
     void startReconnectThread(); ///< 启动重连线程
     void stopReconnectThread();  ///< 停止重连线程
+
+    // ⭐ 异步发布支持 (避免在调用线程阻塞)
+    struct PublishItem {
+        std::string topic;
+        std::string payload;
+        int qos;
+        bool retained;
+    };
+
+    std::thread publishThread_;                ///< 发布线程
+    std::deque<PublishItem> publishQueue_;     ///< 发布队列
+    std::mutex publishMutex_;                  ///< 保护发布队列
+    std::condition_variable publishCv_;        ///< 发布队列唤醒
+    bool publishThreadRunning_;                ///< 发布线程标志
+    void startPublishThread();                 ///< 启动发布线程
+    void stopPublishThread();                  ///< 停止发布线程
+    void publishThreadFunc();                  ///< 发布线程函数
     
     // ⭐ DJI Cloud API 辅助方法
     /**
@@ -297,7 +315,8 @@ MqttClient::Impl::Impl()
       connected_(false),
       reconnecting_(false),  // 初始化重连标志为false
       shouldReconnect_(false),  // ⭐ 初始化重连信号为false
-      threadRunning_(false),    // ⭐ 线程未运行
+    threadRunning_(false),    // ⭐ 线程未运行
+    publishThreadRunning_(false), // 发布线程未运行
       logger_(core::Logger::getInstance()),  // 缓存Logger引用
       config_(core::Config::getInstance()) {  // 缓存Config引用
     
@@ -305,6 +324,8 @@ MqttClient::Impl::Impl()
     
     // ⭐ 启动重连线程
     startReconnectThread();
+    // ⭐ 启动发布线程
+    startPublishThread();
 }
 
 MqttClient::Impl::~Impl() {
@@ -312,6 +333,8 @@ MqttClient::Impl::~Impl() {
     
     // ⭐ 先停止重连线程
     stopReconnectThread();
+    // ⭐ 停止发布线程
+    stopPublishThread();
     
     // 断开连接并清理资源
     disconnect();
@@ -471,44 +494,67 @@ bool MqttClient::Impl::isConnected() const {
 
 bool MqttClient::Impl::publish(const std::string& topic, const std::string& message,
                                int qos, bool retained) {
+    // 使用默认QoS（如果qos=-1）
+    int actualQos = (qos == -1) ? defaultQos_ : qos;
+
+    // 对于 QoS==0，使用异步队列，避免阻塞调用线程
+    if (actualQos == 0) {
+        // 限制队列长度，防止内存无限增长
+        const size_t MAX_QUEUE_SIZE = 1024;
+
+        std::lock_guard<std::mutex> lock(publishMutex_);
+        if (publishQueue_.size() >= MAX_QUEUE_SIZE) {
+            // 丢弃最旧的一条消息以腾出空间
+            logger_.warning("发布队列已满，丢弃最旧消息以腾出空间");
+            publishQueue_.pop_front();
+        }
+
+        PublishItem item;
+        item.topic = topic;
+        item.payload = message;
+        item.qos = actualQos;
+        item.retained = retained;
+
+        publishQueue_.push_back(std::move(item));
+        publishCv_.notify_one();
+
+        logger_.debug("已将消息入队（异步发布）, 主题: " + topic + ", 长度: " + std::to_string(message.length()));
+        return true;
+    }
+
+    // 对于 QoS>0，保留同步语义（调用方需要等待确认）
     if (!isConnected()) {
         logger_.error("MQTT未连接，无法发布消息到主题: " + topic);
         return false;
     }
-    
-    // 使用默认QoS（如果qos=-1）
-    int actualQos = (qos == -1) ? defaultQos_ : qos;
-    
+
     // 配置消息
     MQTTClient_message pubmsg = MQTTClient_message_initializer;
     pubmsg.payload = const_cast<char*>(message.c_str());
     pubmsg.payloadlen = static_cast<int>(message.length());
     pubmsg.qos = actualQos;
     pubmsg.retained = retained ? 1 : 0;
-    
+
     MQTTClient_deliveryToken token;
-    
+
     logger_.debug("发布消息到主题 [" + topic + "], QoS=" + std::to_string(actualQos) +
                    ", 长度=" + std::to_string(message.length()));
-    
-    // 发布消息
+
+    // 发布消息（同步等待）
     int rc = MQTTClient_publishMessage(pahoClient_, topic.c_str(), &pubmsg, &token);
-    
+
     if (rc != MQTTCLIENT_SUCCESS) {
         logger_.error("发布消息失败, 主题: " + topic + ", 错误码: " + std::to_string(rc));
         return false;
     }
-    
+
     // QoS > 0 时等待确认
-    if (actualQos > 0) {
-        rc = MQTTClient_waitForCompletion(pahoClient_, token, timeoutMs_);
-        if (rc != MQTTCLIENT_SUCCESS) {
-            logger_.warning("等待消息确认超时, token: " + std::to_string(token));
-        }
+    rc = MQTTClient_waitForCompletion(pahoClient_, token, timeoutMs_);
+    if (rc != MQTTCLIENT_SUCCESS) {
+        logger_.warning("等待消息确认超时, token: " + std::to_string(token));
     }
-    
+
     logger_.debug("消息发布成功, 主题: " + topic);
-    
     return true;
 }
 
@@ -685,7 +731,17 @@ int MqttClient::Impl::onMessageArrivedCallback(void* context, char* topicName,
     }
     
     self->logger_.debug("收到MQTT消息, 主题: " + topic + ", 长度: " + std::to_string(msg.length()));
-    
+    // if (topic == "算法启用") {
+    //     handler->handleAlgorithmEnable(msg);
+    // } else if (topic == "算法同步") {
+    //     handler->handleAlgorithmSync(msg);
+    // } else if (topic == "算法结束") {
+    //     handler->handleAlgorithmEnd(msg);
+    // } else if (topic == "算法状态") {
+    //     handler->handleAlgorithmStatus(msg);
+    // } else if (topic == "算法配置") {
+    //     handler->handleAlgorithmConfig(msg);
+    // }
     // 通知观察者
     self->notifyMessageReceived(topic, msg);
     
@@ -998,6 +1054,92 @@ void MqttClient::Impl::stopReconnectThread() {
     }
     
     logger_.info("✅ 重连线程已停止");
+}
+
+// ==================== 发布线程实现 ====================
+void MqttClient::Impl::publishThreadFunc() {
+    logger_.info("🧵 发布线程启动");
+
+    while (publishThreadRunning_) {
+        PublishItem item;
+
+        {
+            std::unique_lock<std::mutex> lock(publishMutex_);
+            publishCv_.wait_for(lock, std::chrono::milliseconds(500), [this] {
+                return !publishQueue_.empty() || !publishThreadRunning_;
+            });
+
+            if (!publishThreadRunning_) break;
+
+            if (publishQueue_.empty()) continue;
+
+            item = std::move(publishQueue_.front());
+            publishQueue_.pop_front();
+        }
+
+        // 如果未连接，放回队列并等待
+        if (!isConnected()) {
+            logger_.warning("发布线程: MQTT 未连接，等待重连后重试，topic=" + item.topic);
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::lock_guard<std::mutex> lock(publishMutex_);
+            publishQueue_.push_front(std::move(item));
+            continue;
+        }
+
+        // 构建消息并发布（这里使用 paho 同步接口，但在后台线程执行）
+        MQTTClient_message pubmsg = MQTTClient_message_initializer;
+        pubmsg.payload = const_cast<char*>(item.payload.c_str());
+        pubmsg.payloadlen = static_cast<int>(item.payload.length());
+        pubmsg.qos = item.qos;
+        pubmsg.retained = item.retained ? 1 : 0;
+
+        MQTTClient_deliveryToken token;
+        int rc = MQTTClient_publishMessage(pahoClient_, item.topic.c_str(), &pubmsg, &token);
+
+        if (rc != MQTTCLIENT_SUCCESS) {
+            logger_.error("发布线程: 发布消息失败, topic=" + item.topic + ", rc=" + std::to_string(rc));
+            // 失败时短暂等待并重试（将消息丢回队列尾）
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            std::lock_guard<std::mutex> lock(publishMutex_);
+            publishQueue_.push_back(std::move(item));
+            continue;
+        }
+
+        if (item.qos > 0) {
+            rc = MQTTClient_waitForCompletion(pahoClient_, token, timeoutMs_);
+            if (rc != MQTTCLIENT_SUCCESS) {
+                logger_.warning("发布线程: 等待消息确认超时, token=" + std::to_string(token));
+            }
+        }
+
+        logger_.debug("发布线程: 消息已发布, topic=" + item.topic + ", qos=" + std::to_string(item.qos));
+    }
+
+    logger_.info("🧵 发布线程退出");
+}
+
+void MqttClient::Impl::startPublishThread() {
+    if (publishThreadRunning_) {
+        logger_.warning("发布线程已在运行");
+        return;
+    }
+
+    publishThreadRunning_ = true;
+    publishThread_ = std::thread(&Impl::publishThreadFunc, this);
+    logger_.info("✅ 发布线程已启动");
+}
+
+void MqttClient::Impl::stopPublishThread() {
+    if (!publishThreadRunning_) return;
+
+    logger_.info("正在停止发布线程...");
+    {
+        std::lock_guard<std::mutex> lock(publishMutex_);
+        publishThreadRunning_ = false;
+    }
+    publishCv_.notify_one();
+    if (publishThread_.joinable()) publishThread_.join();
+    logger_.info("✅ 发布线程已停止");
 }
 
 void MqttClient::Impl::loadConfig() {

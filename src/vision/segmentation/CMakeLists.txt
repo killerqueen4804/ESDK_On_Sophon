@@ -12,6 +12,7 @@
 set(SEGMENTATION_SOURCES
     ISegmentor.cpp
     PaddleSegmentor.cpp
+    Sam2Segmentor.cpp
 )
 
 # ----------------------------------------------------------------------------
@@ -41,6 +42,9 @@ target_link_libraries(segmentation
     PRIVATE
         ThirdParty::FastDeploy
         ThirdParty::OpenCV
+        ThirdParty::bmlib     # BMLib 底层库 (提供 bm_dev_request, bm_memcpy_s2d 等)
+        ThirdParty::bmrt      # BMRuntime 推理引擎
+        ThirdParty::bmcv      # BMCV 图像处理加速
 )
 
 # ----------------------------------------------------------------------------

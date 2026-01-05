@@ -755,7 +755,29 @@ void LiveStreamTask::detectionLoop() {
             // ⭐ 异常保护：确保即使 processFrame 出错也能退出
             try {
                 // 调用业务服务进行检测
-                if (service_->processFrame(processFrame, config_, boxes)) {
+                // 直播流：取帧时刻读取一次 GPS（OSD），并与本帧绑定。
+                // 好处：避免使用“上报瞬间”的 GPS，导致经纬度与图片帧不一致。
+                auto& flightData = device::FlightDataProvider::getInstance();
+                auto gpsSnapshot = flightData.getGpsPosition();
+
+                // 只在 GPS 数据“有效且新鲜”的情况下传给 TaskService。
+                // 这样可以保证事件顶层经纬度与“取帧时刻”一致，且避免使用默认 0/0 或过期值。
+                const device::GpsPosition* gpsPtr = nullptr;
+                if (flightData.isGpsDataValid() && gpsSnapshot.isValid()) {
+                    gpsPtr = &gpsSnapshot;
+                }
+
+                // 诊断日志：帮助确认为什么事件顶层经纬度仍为 null
+                if (processedCount == 1 || processedCount % 30 == 0) {
+                    logger_.info("📍 [GPS快照] valid=" + std::string(gpsSnapshot.isValid() ? "true" : "false") +
+                                 ", fresh=" + std::string(flightData.isGpsDataValid() ? "true" : "false") +
+                                 ", age=" + std::to_string(flightData.getGpsDataAge()) + "s" +
+                                 ", lat=" + std::to_string(gpsSnapshot.latitude) +
+                                 ", lon=" + std::to_string(gpsSnapshot.longitude) +
+                                 ", passedToService=" + std::string(gpsPtr ? "true" : "false"));
+                }
+
+                if (service_->processFrame(processFrame, config_, boxes, "", gpsPtr)) {
                     std::lock_guard<std::mutex> lock(statsMutex_);
                     stats_.eventsPublished++;
                 }

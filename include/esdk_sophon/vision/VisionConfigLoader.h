@@ -140,10 +140,11 @@ public:
      * @details
      * 读取.names或.txt文件,每行一个类别名称
      * 
-     * @note 如果文件不存在,返回COCO 80类的默认标签
+    * @note 标签文件属于模型-数据集强绑定配置。
+    *       为避免不同模型类别不一致导致的错误映射，本项目要求 labelsPath 必须可读取且非空。
      * 
      * @code
-     * auto classes = loader.loadClassLabels("models/coco.names");
+    * auto classes = loader.loadClassLabels("/data/Edge-SDK/models/xxx/your.names");
      * // classes[0] = "person"
      * // classes[1] = "bicycle"
      * @endcode
@@ -154,16 +155,8 @@ private:
     core::Config& config_;     ///< Config单例引用
     core::Logger& logger_;     ///< Logger单例引用
     
-    /**
-     * @brief 获取默认的COCO类别标签
-     * 
-     * @return std::vector<std::string> COCO 80类标签
-     * 
-     * @details
-     * 提供COCO数据集的80个类别名称
-     * 作为loadClassLabels()失败时的备用方案
-     */
-    std::vector<std::string> getDefaultCocoLabels() const;
+    // 说明：不再提供默认 COCO 标签的兜底逻辑。
+    // 原因：不同模型/数据集类别顺序可能不同，继续兜底会“静默错配”，比直接失败更难排查。
 };
 
 }  // namespace vision
